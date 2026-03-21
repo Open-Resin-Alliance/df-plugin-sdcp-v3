@@ -19,6 +19,21 @@ type SdcpDiscoveredDevice = {
   firmwareVersion: string;
 };
 
+type SdcpWsFrame = {
+  Id?: unknown;
+  Data?: {
+    Cmd?: unknown;
+    Data?: Record<string, unknown>;
+    RequestID?: unknown;
+    MainboardID?: unknown;
+    TimeStamp?: unknown;
+    From?: unknown;
+  };
+  MainboardID?: unknown;
+  Topic?: unknown;
+  TimeStamp?: unknown;
+};
+
 const DEFAULT_SDCP_PORT = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT = 3000;
 
@@ -182,6 +197,512 @@ function parseSdcpDiscoveryResponse(message: string): Partial<SdcpDiscoveredDevi
       firmwareVersion: extractFromLooseText(trimmed, ['Version', 'firmwareVersion']),
     };
   }
+}
+
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function looksLikeMainboardId(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized) return false;
+  if (isPlainIpv4(normalized)) return false;
+  if (normalized.length < 4 || normalized.length > 128) return false;
+  if (/\s/.test(normalized)) return false;
+  if (normalized.includes('/')) return false;
+  return /^[a-z0-9_-]+$/i.test(normalized);
+}
+
+function hashPlateIdFromPath(path: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i += 1) {
+    hash ^= path.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const normalized = (hash >>> 0) & 0x7fffffff;
+  return Math.max(1, normalized);
+}
+
+function parseSdcpWsFrame(data: string): SdcpWsFrame | null {
+  try {
+    const parsed = JSON.parse(data) as SdcpWsFrame;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function getFrameTopic(frame: SdcpWsFrame | null | undefined): string {
+  const topic = typeof frame?.Topic === 'string' ? frame.Topic.trim() : '';
+  return topic.toLowerCase();
+}
+
+function getFrameMainboardId(frame: SdcpWsFrame | null | undefined): string {
+  const direct = typeof frame?.Data?.MainboardID === 'string'
+    ? frame.Data.MainboardID.trim()
+    : typeof frame?.MainboardID === 'string'
+      ? frame.MainboardID.trim()
+      : '';
+  if (looksLikeMainboardId(direct)) return direct;
+
+  const topic = getFrameTopic(frame);
+  const lastSegment = topic.split('/').pop()?.trim() ?? '';
+  return looksLikeMainboardId(lastSegment) ? lastSegment : '';
+}
+
+async function resolveMainboardIdForHost(host: string, port: number): Promise<string> {
+  const wsDiscovered = await resolveMainboardIdViaWebSocket(host, port, 1800);
+  if (looksLikeMainboardId(wsDiscovered)) return wsDiscovered;
+
+  const udpDiscovered = await resolveMainboardIdViaUdp(host, 1400);
+  if (looksLikeMainboardId(udpDiscovered)) return udpDiscovered;
+
+  const probe = await probeSdcpHost(host, port, 1800);
+  if (!probe) return '';
+  const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probe, 1400);
+  const candidate = enriched.hostName?.trim() ?? '';
+  if (!looksLikeMainboardId(candidate)) return '';
+  if (candidate.toLowerCase() === host.toLowerCase()) return '';
+  return candidate;
+}
+
+async function resolveMainboardIdViaUdp(targetHost: string, timeoutMs: number): Promise<string> {
+  const devices = await discoverSdcpDevicesViaUdp(Math.max(400, Math.min(timeoutMs, 4000)));
+  const target = devices.find((device) => device.ipAddress.trim().toLowerCase() === targetHost.trim().toLowerCase()) ?? null;
+  if (!target) return '';
+  const candidate = target.hostName?.trim() ?? '';
+  return looksLikeMainboardId(candidate) ? candidate : '';
+}
+
+async function resolveMainboardIdViaWebSocket(host: string, port: number, timeoutMs: number): Promise<string> {
+  const url = `ws://${host}:${port}/websocket`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let ws: WebSocket | null = null;
+
+    const finish = (value: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws?.close();
+      } catch {
+        // no-op
+      }
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => finish(''), Math.max(500, Math.min(timeoutMs, 5000)));
+
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      clearTimeout(timer);
+      finish('');
+      return;
+    }
+
+    ws.addEventListener('open', () => {
+      try {
+        ws?.send('ping');
+      } catch {
+        // no-op
+      }
+    });
+
+    ws.addEventListener('message', (event) => {
+      const payload = decodeWsMessageData((event as MessageEvent).data);
+      if (!payload || payload === 'pong') return;
+      const frame = parseSdcpWsFrame(payload);
+      if (!frame) return;
+      const mainboardId = getFrameMainboardId(frame);
+      if (!looksLikeMainboardId(mainboardId)) return;
+      clearTimeout(timer);
+      finish(mainboardId.trim());
+    });
+
+    ws.addEventListener('error', () => {
+      clearTimeout(timer);
+      finish('');
+    });
+
+    ws.addEventListener('close', () => {
+      clearTimeout(timer);
+      finish('');
+    });
+  });
+}
+
+async function handleSdcpUploadChunk(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const uuid = typeof (payload as any)?.uuid === 'string' ? (payload as any).uuid.trim() : '';
+  const fileName = typeof (payload as any)?.fileName === 'string' ? (payload as any).fileName.trim() : '';
+  const totalSize = clampNumber((payload as any)?.totalSize, 0, 0, Number.MAX_SAFE_INTEGER);
+  const offset = clampNumber((payload as any)?.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+  const chunkBase64 = typeof (payload as any)?.chunkBase64 === 'string' ? (payload as any).chunkBase64.trim() : '';
+  if (!uuid || !fileName || !chunkBase64) {
+    return { status: 400, body: { ok: false, error: 'Missing required SDCP upload chunk fields' } };
+  }
+
+  let chunkBuffer: Buffer;
+  try {
+    chunkBuffer = Buffer.from(chunkBase64, 'base64');
+  } catch {
+    return { status: 400, body: { ok: false, error: 'Invalid chunkBase64 payload' } };
+  }
+
+  if (!chunkBuffer || chunkBuffer.length === 0) {
+    return { status: 400, body: { ok: false, error: 'Decoded upload chunk is empty' } };
+  }
+
+  const form = new FormData();
+  form.set('S-File-MD5', '');
+  form.set('Check', '0');
+  form.set('Offset', String(offset));
+  form.set('Uuid', uuid);
+  form.set('TotalSize', String(totalSize));
+  const blobPart = chunkBuffer as unknown as BlobPart;
+  form.set('File', new Blob([blobPart]), fileName);
+
+  try {
+    const response = await fetch(`http://${parsedHost.host}:${port}/uploadFile/upload`, {
+      method: 'POST',
+      body: form,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!response.ok) {
+      return {
+        status: response.status,
+        body: {
+          ok: false,
+          error: `SDCP upload chunk failed (HTTP ${response.status})`,
+        },
+      };
+    }
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+      },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'SDCP upload chunk request failed';
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        error: message,
+      },
+    };
+  }
+}
+
+async function sendSdcpCommandAndAwaitResponse(args: {
+  host: string;
+  port: number;
+  mainboardId: string;
+  cmd: number;
+  data?: Record<string, unknown>;
+  timeoutMs: number;
+}): Promise<SdcpWsFrame | null> {
+  const { host, port, mainboardId, cmd, data = {}, timeoutMs } = args;
+  const startedAt = Date.now();
+  const requestId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `sdcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const requestPayload = {
+    Id: 'dragonfruit',
+    Data: {
+      Cmd: cmd,
+      Data: data,
+      RequestID: requestId,
+      MainboardID: mainboardId,
+      TimeStamp: nowUnixSeconds(),
+      From: 0,
+    },
+    Topic: `sdcp/request/${mainboardId}`,
+  };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let ws: WebSocket | null = null;
+
+    const finish = (value: SdcpWsFrame | null) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws?.close();
+      } catch {
+        // no-op
+      }
+      resolve(value);
+    };
+
+    const effectiveTimeoutMs = Math.max(700, Math.min(timeoutMs, 7000));
+    const timer = setTimeout(() => {
+      if (cmd === 386) {
+        console.warn('[SDCP/Webcam] WebSocket command timed out', {
+          host,
+          port,
+          cmd,
+          requestId,
+          timeoutMs: effectiveTimeoutMs,
+          elapsedMs: Date.now() - startedAt,
+        });
+      }
+      finish(null);
+    }, effectiveTimeoutMs);
+
+    try {
+      ws = new WebSocket(`ws://${host}:${port}/websocket`);
+    } catch {
+      clearTimeout(timer);
+      finish(null);
+      return;
+    }
+
+    ws.addEventListener('open', () => {
+      try {
+        ws?.send('ping');
+      } catch {
+        // no-op
+      }
+      try {
+        ws?.send(JSON.stringify(requestPayload));
+      } catch {
+        clearTimeout(timer);
+        finish(null);
+      }
+    });
+
+    ws.addEventListener('message', (event) => {
+      const payload = decodeWsMessageData((event as MessageEvent).data);
+      if (!payload || payload === 'pong') return;
+      const frame = parseSdcpWsFrame(payload);
+      if (!frame) return;
+      const topic = getFrameTopic(frame);
+      if (!topic.startsWith(`sdcp/response/${mainboardId.toLowerCase()}`)) return;
+      if (Number(frame.Data?.Cmd) !== cmd) return;
+      if (String(frame.Data?.RequestID ?? '').trim() !== requestId) return;
+      clearTimeout(timer);
+      finish(frame);
+    });
+
+    ws.addEventListener('error', () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+
+    ws.addEventListener('close', () => {
+      clearTimeout(timer);
+      finish(null);
+    });
+  });
+}
+
+async function requestSdcpStatusAndAttributes(args: {
+  host: string;
+  port: number;
+  mainboardId: string;
+  timeoutMs: number;
+}): Promise<{ statusFrame: SdcpWsFrame | null; attributesFrame: SdcpWsFrame | null }> {
+  const { host, port, mainboardId, timeoutMs } = args;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let ws: WebSocket | null = null;
+    let statusFrame: SdcpWsFrame | null = null;
+    let attributesFrame: SdcpWsFrame | null = null;
+
+    const requestIds = {
+      status: `sdcp-status-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      attr: `sdcp-attr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    };
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws?.close();
+      } catch {
+        // no-op
+      }
+      resolve({ statusFrame, attributesFrame });
+    };
+
+    const timer = setTimeout(finish, Math.max(900, Math.min(timeoutMs, 7000)));
+
+    try {
+      ws = new WebSocket(`ws://${host}:${port}/websocket`);
+    } catch {
+      clearTimeout(timer);
+      finish();
+      return;
+    }
+
+    const sendCommand = (cmd: number, requestId: string) => {
+      ws?.send(JSON.stringify({
+        Id: 'dragonfruit',
+        Data: {
+          Cmd: cmd,
+          Data: {},
+          RequestID: requestId,
+          MainboardID: mainboardId,
+          TimeStamp: nowUnixSeconds(),
+          From: 0,
+        },
+        Topic: `sdcp/request/${mainboardId}`,
+      }));
+    };
+
+    ws.addEventListener('open', () => {
+      try {
+        ws?.send('ping');
+      } catch {
+        // no-op
+      }
+      try {
+        sendCommand(0, requestIds.status);
+        sendCommand(1, requestIds.attr);
+      } catch {
+        clearTimeout(timer);
+        finish();
+      }
+    });
+
+    ws.addEventListener('message', (event) => {
+      const payload = decodeWsMessageData((event as MessageEvent).data);
+      if (!payload || payload === 'pong') return;
+      const frame = parseSdcpWsFrame(payload);
+      if (!frame) return;
+
+      const topic = getFrameTopic(frame);
+      if (topic.startsWith(`sdcp/status/${mainboardId.toLowerCase()}`)) {
+        statusFrame = frame;
+      }
+      if (topic.startsWith(`sdcp/attributes/${mainboardId.toLowerCase()}`)) {
+        attributesFrame = frame;
+      }
+
+      if (statusFrame && attributesFrame) {
+        clearTimeout(timer);
+        finish();
+      }
+    });
+
+    ws.addEventListener('error', () => {
+      clearTimeout(timer);
+      finish();
+    });
+
+    ws.addEventListener('close', () => {
+      clearTimeout(timer);
+      finish();
+    });
+  });
+}
+
+function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
+  stateText: string;
+  state: string;
+  isPrinting: boolean;
+  isPaused: boolean;
+  progressPct: number | null;
+  currentLayer: number | null;
+  totalLayers: number | null;
+  etaSec: number | null;
+  jobName: string | null;
+  taskId: string | null;
+} {
+  const status = (frame?.Data as any)?.Status as Record<string, unknown> | undefined;
+  const printInfo = (status?.PrintInfo as Record<string, unknown> | undefined) ?? {};
+
+  const printStatus = Number(printInfo.Status);
+  const currentLayer = Number.isFinite(Number(printInfo.CurrentLayer)) ? Number(printInfo.CurrentLayer) : null;
+  const totalLayers = Number.isFinite(Number(printInfo.TotalLayer)) ? Number(printInfo.TotalLayer) : null;
+  const currentTicks = Number.isFinite(Number(printInfo.CurrentTicks)) ? Number(printInfo.CurrentTicks) : null;
+  const totalTicks = Number.isFinite(Number(printInfo.TotalTicks)) ? Number(printInfo.TotalTicks) : null;
+  const fileName = typeof printInfo.Filename === 'string' && printInfo.Filename.trim().length > 0
+    ? printInfo.Filename.trim()
+    : null;
+  const taskId = typeof printInfo.TaskId === 'string' && printInfo.TaskId.trim().length > 0
+    ? printInfo.TaskId.trim()
+    : null;
+
+  const progressFromLayer = (
+    currentLayer != null
+    && totalLayers != null
+    && totalLayers > 0
+  ) ? Math.max(0, Math.min(100, (currentLayer / totalLayers) * 100)) : null;
+
+  const progressFromTime = (
+    currentTicks != null
+    && totalTicks != null
+    && totalTicks > 0
+  ) ? Math.max(0, Math.min(100, (currentTicks / totalTicks) * 100)) : null;
+
+  const remainingMs = (
+    currentTicks != null
+    && totalTicks != null
+    && totalTicks >= currentTicks
+  ) ? (totalTicks - currentTicks) : null;
+
+  const statusMap: Record<number, { text: string; printing: boolean; paused: boolean; state: string }> = {
+    0: { text: 'Idle', printing: false, paused: false, state: 'idle' },
+    1: { text: 'Homing', printing: true, paused: false, state: 'printing' },
+    2: { text: 'Dropping', printing: true, paused: false, state: 'printing' },
+    3: { text: 'Exposing', printing: true, paused: false, state: 'printing' },
+    4: { text: 'Lifting', printing: true, paused: false, state: 'printing' },
+    5: { text: 'Pausing', printing: true, paused: false, state: 'printing' },
+    6: { text: 'Paused', printing: true, paused: true, state: 'paused' },
+    7: { text: 'Stopping', printing: false, paused: false, state: 'canceling' },
+    8: { text: 'Stopped', printing: false, paused: false, state: 'idle' },
+    9: { text: 'Complete', printing: false, paused: false, state: 'idle' },
+    10: { text: 'File Checking', printing: false, paused: false, state: 'processing' },
+  };
+
+  const mapped = Number.isFinite(printStatus) ? statusMap[printStatus] : undefined;
+
+  return {
+    stateText: mapped?.text || 'Online',
+    state: mapped?.state || 'online',
+    isPrinting: mapped?.printing ?? false,
+    isPaused: mapped?.paused ?? false,
+    progressPct: progressFromLayer ?? progressFromTime,
+    currentLayer,
+    totalLayers,
+    etaSec: remainingMs != null ? Math.max(0, Math.round(remainingMs / 1000)) : null,
+    jobName: fileName,
+    taskId,
+  };
+}
+
+function parseSdcpFileListFromResponse(frame: SdcpWsFrame | null): Array<Record<string, unknown>> {
+  const payload = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
+  const fileList = Array.isArray(payload.FileList) ? payload.FileList : [];
+  return fileList.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'));
+}
+
+function derivePlateNameFromPath(path: string): string {
+  const normalized = path.trim();
+  if (!normalized) return 'Unknown File';
+  const segments = normalized.split('/').filter(Boolean);
+  return segments[segments.length - 1] ?? normalized;
 }
 
 function hasUsefulIdentityFields(identity: Partial<SdcpDiscoveredDevice> | null | undefined): boolean {
@@ -484,12 +1005,384 @@ async function handleSdcpDiscover(payload: unknown): Promise<HandlerResult> {
   };
 }
 
+async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, connected: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const probed = await probeSdcpHost(parsedHost.host, port, 2500);
+  if (!probed) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        connected: false,
+        mode: 'sdcp',
+        hostName: parsedHost.host,
+        printerName: '',
+        ipAddress: parsedHost.host,
+        port,
+        stateText: 'Offline',
+        statusText: 'SDCP host unreachable',
+        state: 'offline',
+        isPrinting: false,
+        isPaused: false,
+        progressPct: null,
+        currentLayer: null,
+        totalLayers: null,
+        plateId: null,
+        jobName: null,
+        etaSec: null,
+      },
+    };
+  }
+
+  const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probed, 1400);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+
+  const telemetry = mainboardId
+    ? await requestSdcpStatusAndAttributes({ host: parsedHost.host, port, mainboardId, timeoutMs: 2800 })
+    : { statusFrame: null, attributesFrame: null };
+  const printInfo = extractPrintInfoFromStatusFrame(telemetry.statusFrame);
+
+  const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
+  const firmwareVersionFromAttrs = typeof attributes?.FirmwareVersion === 'string'
+    ? attributes.FirmwareVersion.trim()
+    : '';
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      connected: true,
+      mode: 'sdcp',
+      hostName: enriched.hostName,
+      printerName: enriched.printerName,
+      printerModel: enriched.printerModel,
+      ipAddress: enriched.ipAddress,
+      port: enriched.port,
+      mainboardId,
+      firmwareVersion: firmwareVersionFromAttrs || enriched.firmwareVersion,
+      stateText: printInfo.stateText || enriched.statusText || 'Online',
+      statusText: enriched.statusText,
+      state: printInfo.state || enriched.state || 'online',
+      isPrinting: printInfo.isPrinting,
+      isPaused: printInfo.isPaused,
+      progressPct: printInfo.progressPct,
+      currentLayer: printInfo.currentLayer,
+      totalLayers: printInfo.totalLayers,
+      plateId: printInfo.taskId ? hashPlateIdFromPath(printInfo.taskId) : null,
+      jobName: printInfo.jobName,
+      etaSec: printInfo.etaSec,
+    },
+  };
+}
+
+async function handleSdcpWebcamInfo(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, available: false, message: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        available: false,
+        streamUrl: null,
+        snapshotUrl: null,
+        message: 'Unable to resolve SDCP mainboard ID for webcam stream command.',
+      },
+    };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 386,
+    data: { Enable: 1 },
+    timeoutMs: 3200,
+  });
+
+  const data = (response?.Data?.Data ?? {}) as Record<string, unknown>;
+  const ack = Number(data.Ack);
+  const videoUrl = typeof data.VideoUrl === 'string' ? data.VideoUrl.trim() : '';
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      available: ack === 0 && videoUrl.length > 0,
+      streamUrl: videoUrl || null,
+      snapshotUrl: null,
+      message: ack === 0
+        ? (videoUrl ? 'RTSP video stream enabled.' : 'Video stream enabled but URL missing.')
+        : ack === 1
+          ? 'Exceeded maximum simultaneous SDCP video stream limit.'
+          : ack === 2
+            ? 'SDCP camera does not exist on this printer.'
+            : 'Failed to enable SDCP video stream.',
+    },
+  };
+}
+
+async function handleSdcpWebcamDisable(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, available: false, message: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        available: false,
+        streamUrl: null,
+        snapshotUrl: null,
+        message: 'Unable to resolve SDCP mainboard ID for webcam disable command.',
+      },
+    };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 386,
+    data: { Enable: 0 },
+    timeoutMs: 3200,
+  });
+
+  const data = (response?.Data?.Data ?? {}) as Record<string, unknown>;
+  const ack = Number(data.Ack);
+
+  const telemetry = ack === 0
+    ? await requestSdcpStatusAndAttributes({
+      host: parsedHost.host,
+      port,
+      mainboardId,
+      timeoutMs: 400,
+    })
+    : { statusFrame: null, attributesFrame: null };
+  const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
+  const connectedStreams = Number(attributes?.NumberOfVideoStreamConnected);
+  const maximumStreams = Number(attributes?.MaximumVideoStreamAllowed);
+  const cameraStatus = Number(attributes?.CameraStatus);
+
+  const hasConnected = Number.isFinite(connectedStreams);
+  const hasMaximum = Number.isFinite(maximumStreams) && maximumStreams > 0;
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0 || ack === 1,
+      available: false,
+      streamUrl: null,
+      snapshotUrl: null,
+      connectedStreams: hasConnected ? connectedStreams : null,
+      maximumStreams: hasMaximum ? maximumStreams : null,
+      cameraStatus: Number.isFinite(cameraStatus) ? cameraStatus : null,
+      message: ack === 0
+        ? (hasConnected && hasMaximum
+          ? `Requested SDCP webcam stream reset (${connectedStreams} of ${maximumStreams} stream slots currently in use). Retry to reacquire the feed.`
+          : 'Requested SDCP webcam stream reset. Retry to reacquire the feed.')
+        : ack === 1
+          ? 'SDCP reports stream-slot contention while disabling webcam stream. Reset request was sent, but another client may still own the stream slot.'
+        : ack === 2
+          ? 'SDCP camera does not exist on this printer.'
+          : 'Failed to disable SDCP webcam stream.',
+    },
+  };
+}
+
+async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, metadataReady: false, error: 'Invalid host or IP address', plates: [] } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return {
+      status: 200,
+      body: {
+        ok: false,
+        metadataReady: false,
+        error: 'Unable to resolve SDCP mainboard ID for file list command.',
+        matchedPlate: null,
+        plates: [],
+      },
+    };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 258,
+    data: { Url: '/local/' },
+    timeoutMs: 3200,
+  });
+  const payloadData = (response?.Data?.Data ?? {}) as Record<string, unknown>;
+  const ack = Number(payloadData.Ack);
+  const list = parseSdcpFileListFromResponse(response)
+    .filter((entry) => Number(entry.type) === 1)
+    .map((entry) => {
+      const fullPath = typeof entry.name === 'string' ? entry.name.trim() : '';
+      const name = derivePlateNameFromPath(fullPath);
+      return {
+        PlateID: hashPlateIdFromPath(fullPath || name),
+        plateId: hashPlateIdFromPath(fullPath || name),
+        Path: fullPath || name,
+        path: fullPath || name,
+        Name: name,
+        name,
+      };
+    });
+
+  const requestedPlateId = Number((payload as any)?.plateId);
+  const requestedJobName = typeof (payload as any)?.jobName === 'string' ? (payload as any).jobName.trim().toLowerCase() : '';
+  const matchedPlate = list.find((entry) => {
+    if (Number.isFinite(requestedPlateId) && requestedPlateId > 0) {
+      return Number((entry as any).PlateID) === Math.round(requestedPlateId);
+    }
+    if (requestedJobName) {
+      const path = String((entry as any).Path ?? '').toLowerCase();
+      const name = String((entry as any).Name ?? '').toLowerCase();
+      return path.includes(requestedJobName) || name.includes(requestedJobName);
+    }
+    return false;
+  }) ?? null;
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      metadataReady: matchedPlate != null || requestedJobName.length === 0,
+      matchedPlate,
+      plates: list,
+      error: ack === 0 ? undefined : 'SDCP file list request failed.',
+    },
+  };
+}
+
+async function handleSdcpControlOperation(payload: unknown, cmd: number, opLabel: string): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for control command.' } };
+  }
+
+  const controlData: Record<string, unknown> = {};
+  if (cmd === 128) {
+    const filename = typeof (payload as any)?.filename === 'string' && (payload as any).filename.trim().length > 0
+      ? (payload as any).filename.trim()
+      : typeof (payload as any)?.jobName === 'string' && (payload as any).jobName.trim().length > 0
+        ? `${(payload as any).jobName.trim().replace(/\.[^.]+$/i, '')}.ctb`
+        : '';
+    if (!filename) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          error: 'Start printing requires filename or jobName for SDCP Cmd 128.',
+        },
+      };
+    }
+    controlData.Filename = filename;
+    controlData.StartLayer = 0;
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd,
+    data: controlData,
+    timeoutMs: 3200,
+  });
+  const ack = Number((response?.Data?.Data as any)?.Ack);
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      ack,
+      message: ack === 0
+        ? `SDCP command ${opLabel} accepted.`
+        : `SDCP command ${opLabel} rejected (Ack ${Number.isFinite(ack) ? ack : 'unknown'}).`,
+      error: ack === 0 ? undefined : `SDCP ${opLabel} failed.`,
+    },
+  };
+}
+
 function handleUnsupportedSdcpOperation(op: string): HandlerResult {
   return {
     status: 404,
     body: {
       error: `Unsupported SDCP operation: ${op}`,
       note: 'SDCP backend does not expose remote material profile operations.',
+    },
+  };
+}
+
+function handleSdcpRtspProxyUnsupported(op: string): HandlerResult {
+  return {
+    status: 501,
+    body: {
+      ok: false,
+      error: `Unsupported SDCP operation in web runtime: ${op}`,
+      note: 'RTSP proxy streaming is currently available in the desktop runtime only.',
     },
   };
 }
@@ -503,6 +1396,17 @@ export async function handleSdcpV3NetworkOperation(operationPath: string[], payl
 
   if (op === 'connect') return handleSdcpConnect(payload);
   if (op === 'discover') return handleSdcpDiscover(payload);
+  if (op === 'printer/status') return handleSdcpPrinterStatus(payload);
+  if (op === 'printer/webcam/info') return handleSdcpWebcamInfo(payload);
+  if (op === 'printer/webcam/disable') return handleSdcpWebcamDisable(payload);
+  if (op === 'rtsp/proxy/start' || op === 'rtsp/proxy/stop' || op === 'ffmpeg/install') return handleSdcpRtspProxyUnsupported(op);
+  if (op === 'plates/list/json') return handleSdcpPlatesList(payload);
+  if (op === 'printer/start') return handleSdcpControlOperation(payload, 128, op);
+  if (op === 'printer/pause') return handleSdcpControlOperation(payload, 129, op);
+  if (op === 'printer/stop' || op === 'printer/force-stop') return handleSdcpControlOperation(payload, 130, op);
+  if (op === 'printer/unpause') return handleSdcpControlOperation(payload, 131, op);
+  if (op === 'upload/chunk') return handleSdcpUploadChunk(payload);
+  if (op === 'plate/delete') return handleUnsupportedSdcpOperation(op);
   if (op === 'materials' || op === 'materials/edit' || op === 'unsupported') return handleUnsupportedSdcpOperation(op);
 
   return { status: 404, body: { error: `Unknown SDCP operation: ${op}` } };

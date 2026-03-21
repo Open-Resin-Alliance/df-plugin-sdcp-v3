@@ -1,11 +1,15 @@
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tungstenite::{stream::MaybeTlsStream, Message};
+use base64::Engine;
 
 #[derive(Clone, Serialize)]
 pub struct PluginNetworkResponse {
@@ -14,9 +18,729 @@ pub struct PluginNetworkResponse {
 }
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static RTSP_PROXY_PROCESSES: OnceLock<Mutex<HashMap<String, RtspProxyProcess>>> = OnceLock::new();
+static WEBCAM_STREAM_CACHE: OnceLock<Mutex<HashMap<String, WebcamStreamCacheEntry>>> = OnceLock::new();
 
 const DEFAULT_SDCP_PORT: u16 = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT: u16 = 3000;
+
+struct RtspProxyProcess {
+    local_url: String,
+    child: Child,
+}
+
+struct WebcamStreamCacheEntry {
+    external_stream_url: String,
+    proxy_stream_url: Option<String>,
+    updated_at: Instant,
+}
+
+const WEBCAM_STREAM_CACHE_TTL_MS: u64 = 45_000;
+
+fn rtsp_proxy_processes() -> &'static Mutex<HashMap<String, RtspProxyProcess>> {
+    RTSP_PROXY_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn webcam_stream_cache() -> &'static Mutex<HashMap<String, WebcamStreamCacheEntry>> {
+    WEBCAM_STREAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn webcam_cache_key(host: &str, port: u16, mainboard_id: &str) -> String {
+    format!("{}:{}:{}", host.trim().to_lowercase(), port, mainboard_id.trim().to_lowercase())
+}
+
+fn read_cached_webcam_urls(cache_key: &str) -> Option<(String, String, bool)> {
+    let mut cache = webcam_stream_cache().lock().ok()?;
+    let ttl = Duration::from_millis(WEBCAM_STREAM_CACHE_TTL_MS);
+    cache.retain(|_, entry| entry.updated_at.elapsed() <= ttl);
+
+    let entry = cache.get_mut(cache_key)?;
+    entry.updated_at = Instant::now();
+    let external = entry.external_stream_url.trim().to_string();
+    if external.is_empty() {
+        return None;
+    }
+
+    let proxied = entry
+        .proxy_stream_url
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let effective = proxied.clone().unwrap_or_else(|| external.clone());
+    if effective.is_empty() {
+        return None;
+    }
+
+    Some((effective, external, proxied.is_some()))
+}
+
+fn store_cached_webcam_urls(
+    cache_key: &str,
+    external_stream_url: &str,
+    proxy_stream_url: Option<String>,
+) {
+    let external = external_stream_url.trim().to_string();
+    if external.is_empty() {
+        return;
+    }
+
+    if let Ok(mut cache) = webcam_stream_cache().lock() {
+        cache.insert(
+            cache_key.to_string(),
+            WebcamStreamCacheEntry {
+                external_stream_url: external,
+                proxy_stream_url: proxy_stream_url
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                updated_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn cleanup_dead_rtsp_proxy_processes(processes: &mut HashMap<String, RtspProxyProcess>) {
+    let mut dead_keys: Vec<String> = Vec::new();
+
+    for (key, process) in processes.iter_mut() {
+        match process.child.try_wait() {
+            Ok(Some(_)) => dead_keys.push(key.clone()),
+            Ok(None) => {}
+            Err(_) => dead_keys.push(key.clone()),
+        }
+    }
+
+    for key in dead_keys {
+        processes.remove(&key);
+    }
+}
+
+fn select_free_local_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let local_addr = listener.local_addr().ok()?;
+    Some(local_addr.port())
+}
+
+fn ffmpeg_install_destination_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data)
+                .join("DragonFruit")
+                .join("ffmpeg")
+                .join("ffmpeg.exe");
+        }
+
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            return PathBuf::from(user_profile)
+                .join("AppData")
+                .join("Local")
+                .join("DragonFruit")
+                .join("ffmpeg")
+                .join("ffmpeg.exe");
+        }
+
+        return std::env::temp_dir()
+            .join("DragonFruit")
+            .join("ffmpeg")
+            .join("ffmpeg.exe");
+    }
+
+    std::env::temp_dir()
+        .join("dragonfruit")
+        .join("ffmpeg")
+        .join("ffmpeg")
+}
+
+fn ffmpeg_binary_candidates() -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    let is_windows = cfg!(target_os = "windows");
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            // Dev/runtime local sibling candidates.
+            let sibling_names = if is_windows {
+                ["ffmpeg.exe", "ffmpeg-sidecar.exe", "ffmpeg"]
+            } else {
+                ["ffmpeg", "ffmpeg-sidecar", "ffmpeg"]
+            };
+            for name in sibling_names {
+                let candidate = exe_dir.join(name);
+                if candidate.exists() {
+                    candidates.push(candidate.to_string_lossy().to_string());
+                }
+            }
+
+            // Bundled resource candidates.
+            let resource_candidates = if is_windows {
+                vec![
+                    exe_dir.join("resources").join("binaries").join("ffmpeg").join("ffmpeg.exe"),
+                    exe_dir
+                        .parent()
+                        .map(|p| p.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg"))
+                        .unwrap_or_else(|| exe_dir.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg")),
+                    exe_dir
+                        .parent()
+                        .map(|p| p.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg.exe"))
+                        .unwrap_or_else(|| exe_dir.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg.exe")),
+                ]
+            } else {
+                vec![
+                    exe_dir.join("resources").join("binaries").join("ffmpeg").join("ffmpeg"),
+                    exe_dir
+                        .parent()
+                        .map(|p| p.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg"))
+                        .unwrap_or_else(|| exe_dir.join("Resources").join("binaries").join("ffmpeg").join("ffmpeg")),
+                ]
+            };
+
+            for candidate in resource_candidates {
+                if candidate.exists() {
+                    candidates.push(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(path) = std::env::var("DF_FFMPEG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+
+    if let Ok(path) = std::env::var("FFMPEG_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+
+    let installed_path = ffmpeg_install_destination_path();
+    if installed_path.exists() {
+        candidates.push(installed_path.to_string_lossy().to_string());
+    }
+
+    if is_windows {
+        let common_windows_paths = [
+            r"C:\\ffmpeg\\bin\\ffmpeg.exe",
+            r"C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+            r"C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
+            r"C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",
+        ];
+        for path in common_windows_paths {
+            if std::path::Path::new(path).exists() {
+                candidates.push(path.to_string());
+            }
+        }
+
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            let scoop = format!(r"{}\\scoop\\shims\\ffmpeg.exe", user_profile.trim());
+            if std::path::Path::new(&scoop).exists() {
+                candidates.push(scoop);
+            }
+        }
+    }
+
+    candidates.push("ffmpeg".to_string());
+
+    let mut deduped: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|existing| existing.eq_ignore_ascii_case(&candidate)) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn sdcp_rtsp_proxy_start(payload: &Value) -> (u16, Value) {
+    let rtsp_url = payload
+        .get("rtspUrl")
+        .or_else(|| payload.get("streamUrl"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if rtsp_url.is_empty() || !(rtsp_url.starts_with("rtsp://") || rtsp_url.starts_with("rtsps://")) {
+        return (
+            400,
+            json!({
+                "ok": false,
+                "error": "rtspUrl is required and must use rtsp:// or rtsps://",
+            }),
+        );
+    }
+
+    let mut processes = match rtsp_proxy_processes().lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            return (
+                500,
+                json!({ "ok": false, "error": format!("RTSP proxy lock poisoned: {err}") }),
+            )
+        }
+    };
+
+    cleanup_dead_rtsp_proxy_processes(&mut processes);
+
+    if let Some(existing) = processes.get_mut(&rtsp_url) {
+        match existing.child.try_wait() {
+            Ok(None) => {
+                return (
+                    200,
+                    json!({
+                        "ok": true,
+                        "proxyUrl": existing.local_url,
+                        "rtspUrl": rtsp_url,
+                        "reused": true,
+                    }),
+                )
+            }
+            _ => {
+                processes.remove(&rtsp_url);
+            }
+        }
+    }
+
+    let Some(local_port) = select_free_local_port() else {
+        return (500, json!({ "ok": false, "error": "Unable to allocate local RTSP proxy port" }));
+    };
+
+    let local_url = format!("http://127.0.0.1:{local_port}/stream.mjpg");
+    let ffmpeg_candidates = ffmpeg_binary_candidates();
+
+    let mut child: Option<Child> = None;
+    let mut selected_candidate = String::new();
+    let mut last_error = String::new();
+
+    for candidate in ffmpeg_candidates.iter() {
+        let spawn_result = Command::new(candidate)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-rtsp_transport")
+            .arg("tcp")
+            .arg("-fflags")
+            .arg("nobuffer")
+            .arg("-flags")
+            .arg("low_delay")
+            .arg("-i")
+            .arg(&rtsp_url)
+            .arg("-an")
+            .arg("-vf")
+            .arg("fps=12")
+            .arg("-q:v")
+            .arg("7")
+            .arg("-f")
+            .arg("mpjpeg")
+            .arg("-listen")
+            .arg("1")
+            .arg(&local_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match spawn_result {
+            Ok(process) => {
+                selected_candidate = candidate.clone();
+                child = Some(process);
+                break;
+            }
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    last_error = format!("{candidate}: {err}");
+                    break;
+                }
+                last_error = format!("{candidate}: {err}");
+            }
+        }
+    }
+
+    let mut child = match child {
+        Some(process) => process,
+        None => {
+            let searched = ffmpeg_candidates.join(", ");
+            let details = if last_error.is_empty() {
+                String::new()
+            } else {
+                format!(" Last error: {last_error}")
+            };
+            return (
+                502,
+                json!({
+                    "ok": false,
+                    "error": format!("ffmpeg executable not found. Set DF_FFMPEG_PATH in .env or install ffmpeg. Searched: [{searched}].{details}"),
+                }),
+            );
+        }
+    };
+
+    std::thread::sleep(Duration::from_millis(220));
+    if let Ok(Some(status)) = child.try_wait() {
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": format!("ffmpeg exited before proxy became ready (binary: {selected_candidate}, status: {status})"),
+            }),
+        );
+    }
+
+    processes.insert(
+        rtsp_url.clone(),
+        RtspProxyProcess {
+            local_url: local_url.clone(),
+            child,
+        },
+    );
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "proxyUrl": local_url,
+            "rtspUrl": rtsp_url,
+            "ffmpegBinary": selected_candidate,
+            "reused": false,
+        }),
+    )
+}
+
+fn sdcp_rtsp_proxy_stop(payload: &Value) -> (u16, Value) {
+    let rtsp_url = payload
+        .get("rtspUrl")
+        .or_else(|| payload.get("streamUrl"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut processes = match rtsp_proxy_processes().lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            return (
+                500,
+                json!({ "ok": false, "error": format!("RTSP proxy lock poisoned: {err}") }),
+            )
+        }
+    };
+
+    cleanup_dead_rtsp_proxy_processes(&mut processes);
+
+    let keys: Vec<String> = if rtsp_url.is_empty() {
+        processes.keys().cloned().collect()
+    } else {
+        vec![rtsp_url]
+    };
+
+    let mut stopped = 0u64;
+    for key in keys {
+        if let Some(mut process) = processes.remove(&key) {
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+            stopped += 1;
+        }
+    }
+
+    (200, json!({ "ok": true, "stopped": stopped }))
+}
+
+async fn sdcp_ffmpeg_install(_payload: &Value) -> (u16, Value) {
+    if !cfg!(target_os = "windows") {
+        return (
+            501,
+            json!({
+                "ok": false,
+                "error": "Automatic FFmpeg install is currently supported on Windows only.",
+                "note": "Install an LGPL FFmpeg build manually and set DF_FFMPEG_PATH if needed.",
+            }),
+        );
+    }
+
+    let download_client = match Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .pool_max_idle_per_host(2)
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return (
+                500,
+                json!({
+                    "ok": false,
+                    "error": format!("Failed to create FFmpeg installer HTTP client: {err}"),
+                }),
+            );
+        }
+    };
+
+    let release_api_url = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";
+    let response = match download_client
+        .get(release_api_url)
+        .header("User-Agent", "DragonFruit/1.0 (+https://github.com/Open-Resin-Alliance/DragonFruit)")
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            return (502, json!({ "ok": false, "error": format!("Failed to query FFmpeg release metadata: {err}") }));
+        }
+    };
+
+    if !response.status().is_success() {
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": format!("Failed to query FFmpeg release metadata (HTTP {}).", response.status().as_u16()),
+            }),
+        );
+    }
+
+    let release_payload = match response.json::<Value>().await {
+        Ok(value) => value,
+        Err(err) => {
+            return (502, json!({ "ok": false, "error": format!("Invalid FFmpeg release metadata response: {err}") }));
+        }
+    };
+
+    let assets = release_payload
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let selected_asset = assets.into_iter().find_map(|asset| {
+        let name = asset.get("name")?.as_str()?.trim();
+        let download_url = asset.get("browser_download_url")?.as_str()?.trim();
+        if name.is_empty() || download_url.is_empty() {
+            return None;
+        }
+
+        let lowered = name.to_lowercase();
+        let is_lgpl = lowered.contains("lgpl");
+        let is_windows_64 = lowered.contains("win64") || lowered.contains("windows64") || lowered.contains("windows-64");
+        let is_zip = lowered.ends_with(".zip");
+
+        if is_lgpl && is_windows_64 && is_zip {
+            Some((name.to_string(), download_url.to_string()))
+        } else {
+            None
+        }
+    });
+
+    let Some((asset_name, asset_url)) = selected_asset else {
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": "Could not find a Windows x64 LGPL FFmpeg archive in the latest release.",
+            }),
+        );
+    };
+
+    let archive_response = match download_client
+        .get(&asset_url)
+        .header("User-Agent", "DragonFruit/1.0 (+https://github.com/Open-Resin-Alliance/DragonFruit)")
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            return (502, json!({ "ok": false, "error": format!("Failed to download FFmpeg archive: {err}") }));
+        }
+    };
+
+    if !archive_response.status().is_success() {
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": format!("Failed to download FFmpeg archive (HTTP {}).", archive_response.status().as_u16()),
+            }),
+        );
+    }
+
+    let archive_bytes = match archive_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (502, json!({ "ok": false, "error": format!("Failed reading FFmpeg archive bytes: {err}") }));
+        }
+    };
+
+    let cursor = std::io::Cursor::new(archive_bytes.to_vec());
+    let mut zip_archive = match zip::ZipArchive::new(cursor) {
+        Ok(archive) => archive,
+        Err(err) => {
+            return (502, json!({ "ok": false, "error": format!("Downloaded FFmpeg archive is invalid: {err}") }));
+        }
+    };
+
+    let mut bin_files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut archive_entries_sample: Vec<String> = Vec::new();
+    for index in 0..zip_archive.len() {
+        let mut entry = match zip_archive.by_index(index) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+
+        let normalized_name = entry.name().replace('\\', "/").to_lowercase();
+        if archive_entries_sample.len() < 12 {
+            archive_entries_sample.push(normalized_name.clone());
+        }
+
+        if normalized_name.ends_with('/') {
+            continue;
+        }
+
+        let components: Vec<&str> = normalized_name
+            .split('/')
+            .filter(|segment| !segment.trim().is_empty())
+            .collect();
+        if components.len() < 2 {
+            continue;
+        }
+
+        let parent_segment = components.get(components.len().saturating_sub(2)).copied().unwrap_or("");
+        if parent_segment != "bin" {
+            continue;
+        }
+
+        let file_name = normalized_name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+
+        let include = file_name == "ffmpeg.exe"
+            || file_name.ends_with(".dll")
+            || file_name == "ffprobe.exe";
+        if !include {
+            continue;
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        if entry.read_to_end(&mut buffer).is_ok() && !buffer.is_empty() {
+            bin_files.push((file_name, buffer));
+        }
+    }
+
+    if !bin_files.iter().any(|(name, _)| name == "ffmpeg.exe") {
+        let sample = if archive_entries_sample.is_empty() {
+            "(empty archive listing)".to_string()
+        } else {
+            archive_entries_sample.join(", ")
+        };
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": format!("FFmpeg executable was not found in the downloaded archive bin directory. Archive sample entries: {sample}"),
+            }),
+        );
+    }
+
+    let destination = ffmpeg_install_destination_path();
+    let install_dir = match destination.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => {
+            return (500, json!({ "ok": false, "error": "Invalid FFmpeg installation path." }));
+        }
+    };
+
+    if let Some(parent) = destination.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return (500, json!({ "ok": false, "error": format!("Failed to create FFmpeg install directory: {err}") }));
+        }
+    }
+
+    if let Ok(existing_entries) = std::fs::read_dir(&install_dir) {
+        for existing in existing_entries.flatten() {
+            let path = existing.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let file_name_lower = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+
+            let is_runtime_file = file_name_lower == "ffmpeg.exe"
+                || file_name_lower == "ffprobe.exe"
+                || file_name_lower == "ffplay.exe"
+                || file_name_lower.ends_with(".dll");
+
+            if is_runtime_file {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    for (file_name, bytes) in bin_files.iter() {
+        let output_path = install_dir.join(file_name);
+        if let Err(err) = std::fs::write(&output_path, bytes) {
+            return (500, json!({
+                "ok": false,
+                "error": format!("Failed to write FFmpeg runtime file {}: {err}", output_path.to_string_lossy()),
+            }));
+        }
+    }
+
+    let version_output = Command::new(&destination)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let version_output = match version_output {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = std::fs::remove_file(&destination);
+            return (502, json!({ "ok": false, "error": format!("Installed FFmpeg failed to execute: {err}") }));
+        }
+    };
+
+    let version_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&version_output.stdout),
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+    if version_text.to_lowercase().contains("--enable-gpl") {
+        let _ = std::fs::remove_file(&destination);
+        return (
+            502,
+            json!({
+                "ok": false,
+                "error": "Downloaded FFmpeg build appears to include GPL components; installation was rejected.",
+            }),
+        );
+    }
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "installedPath": destination.to_string_lossy().to_string(),
+            "installedFiles": bin_files.len(),
+            "assetName": asset_name,
+            "source": asset_url,
+            "validatedNoGpl": true,
+            "message": "FFmpeg installed successfully. Retry webcam preview.",
+        }),
+    )
+}
 
 fn http_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
@@ -383,6 +1107,718 @@ fn enrich_sdcp_device_identity_via_websocket(mut device: Value, timeout_ms: u64)
     device
 }
 
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn looks_like_mainboard_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.parse::<Ipv4Addr>().is_ok() {
+        return false;
+    }
+    !trimmed.is_empty()
+        && trimmed.len() >= 4
+        && trimmed.len() <= 128
+        && !trimmed.chars().any(|c| c.is_whitespace())
+        && !trimmed.contains('/')
+        && trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn hash_plate_id_from_path(path: &str) -> i64 {
+    let mut hash: u32 = 2_166_136_261;
+    for b in path.as_bytes() {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+
+    let normalized = (hash & 0x7fff_ffff) as i64;
+    if normalized <= 0 { 1 } else { normalized }
+}
+
+fn frame_topic_lower(frame: &Value) -> String {
+    frame
+        .get("Topic")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+}
+
+async fn resolve_mainboard_id_for_host(host: &str, port: u16) -> String {
+    let ws_discovered = resolve_mainboard_id_via_websocket(host, port, 1800);
+    if looks_like_mainboard_id(&ws_discovered) {
+        return ws_discovered;
+    }
+
+    let udp_discovered = resolve_mainboard_id_via_udp(host, 1400);
+    if looks_like_mainboard_id(&udp_discovered) {
+        return udp_discovered;
+    }
+
+    let Some(device) = probe_sdcp_host(host, port, 1800).await else {
+        return String::new();
+    };
+    let enriched = enrich_sdcp_device_identity_via_websocket(device, 1400);
+    let host_name = enriched
+        .get("hostName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if looks_like_mainboard_id(&host_name) && !host_name.eq_ignore_ascii_case(host) {
+        host_name
+    } else {
+        String::new()
+    }
+}
+
+fn resolve_mainboard_id_via_udp(target_host: &str, timeout_ms: u64) -> String {
+    let devices = discover_sdcp_devices_via_udp(timeout_ms.clamp(400, 4000));
+    let normalized_target = target_host.trim().to_lowercase();
+    let matched = devices.into_iter().find(|device| {
+        device
+            .get("ipAddress")
+            .and_then(|v| v.as_str())
+            .map(|ip| ip.trim().eq_ignore_ascii_case(&normalized_target))
+            .unwrap_or(false)
+    });
+
+    let Some(device) = matched else {
+        return String::new();
+    };
+
+    let candidate = device
+        .get("hostName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if looks_like_mainboard_id(&candidate) {
+        candidate
+    } else {
+        String::new()
+    }
+}
+
+fn resolve_mainboard_id_via_websocket(host: &str, port: u16, timeout_ms: u64) -> String {
+    let url = format!("ws://{host}:{port}/websocket");
+    let Ok((mut socket, _)) = tungstenite::connect(url.as_str()) else {
+        return String::new();
+    };
+
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms.clamp(500, 5000))));
+    }
+
+    let _ = socket.send(Message::Text("ping".into()));
+
+    let started = Instant::now();
+    let deadline = Duration::from_millis(timeout_ms.clamp(500, 5000));
+    while started.elapsed() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let mainboard = frame
+                    .pointer("/Data/MainboardID")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| frame.get("MainboardID").and_then(|v| v.as_str()))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if looks_like_mainboard_id(&mainboard) {
+                    return mainboard;
+                }
+
+                let topic = frame_topic_lower(&frame);
+                let from_topic = topic.split('/').last().unwrap_or("").trim().to_string();
+                if looks_like_mainboard_id(&from_topic) {
+                    return from_topic;
+                }
+            }
+            Ok(Message::Binary(data)) => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let mainboard = frame
+                    .pointer("/Data/MainboardID")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| frame.get("MainboardID").and_then(|v| v.as_str()))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if looks_like_mainboard_id(&mainboard) {
+                    return mainboard;
+                }
+
+                let topic = frame_topic_lower(&frame);
+                let from_topic = topic.split('/').last().unwrap_or("").trim().to_string();
+                if looks_like_mainboard_id(&from_topic) {
+                    return from_topic;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    String::new()
+}
+
+async fn sdcp_upload_chunk(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+
+    let port = resolve_port(payload.get("port"), parsed.1);
+    let uuid = payload.get("uuid").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let file_name = payload
+        .get("fileName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let total_size = payload
+        .get("totalSize")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+        .unwrap_or(0);
+    let offset = payload
+        .get("offset")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+        .unwrap_or(0);
+    let chunk_base64 = payload
+        .get("chunkBase64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if uuid.is_empty() || file_name.is_empty() || chunk_base64.is_empty() {
+        return (
+            400,
+            json!({ "ok": false, "error": "Missing required SDCP upload chunk fields" }),
+        );
+    }
+
+    let chunk_bytes = match base64::engine::general_purpose::STANDARD.decode(chunk_base64.as_bytes()) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => return (400, json!({ "ok": false, "error": "Invalid chunkBase64 payload" })),
+    };
+
+    let file_part = match reqwest::multipart::Part::bytes(chunk_bytes)
+        .file_name(file_name.clone())
+        .mime_str("application/octet-stream")
+    {
+        Ok(part) => part,
+        Err(_) => return (500, json!({ "ok": false, "error": "Failed to prepare SDCP upload chunk" })),
+    };
+
+    let form = reqwest::multipart::Form::new()
+        .text("S-File-MD5", "")
+        .text("Check", "0")
+        .text("Offset", offset.to_string())
+        .text("Uuid", uuid)
+        .text("TotalSize", total_size.to_string())
+        .part("File", file_part);
+
+    let response = http_client()
+        .post(format!("http://{}:{}/uploadFile/upload", parsed.0, port))
+        .multipart(form)
+        .timeout(Duration::from_millis(15_000))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => (200, json!({ "ok": true })),
+        Ok(resp) => (
+            resp.status().as_u16(),
+            json!({
+                "ok": false,
+                "error": format!("SDCP upload chunk failed (HTTP {})", resp.status().as_u16()),
+            }),
+        ),
+        Err(err) => (502, json!({ "ok": false, "error": err.to_string() })),
+    }
+}
+
+fn send_sdcp_command_and_await_response(
+    host: &str,
+    port: u16,
+    mainboard_id: &str,
+    cmd: u64,
+    data: Value,
+    timeout_ms: u64,
+) -> Option<Value> {
+    let url = format!("ws://{host}:{port}/websocket");
+    let (mut socket, _) = match tungstenite::connect(url.as_str()) {
+        Ok(connection) => connection,
+        Err(err) => {
+            if cmd == 386 {
+                eprintln!(
+                    "[SDCP][Webcam] ws connect failed host={} port={} cmd={} error={}",
+                    host, port, cmd, err
+                );
+            }
+            return None;
+        }
+    };
+
+    let effective_timeout_ms = timeout_ms.clamp(700, 7000);
+
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(effective_timeout_ms)));
+    }
+
+    let request_id = format!("sdcp-{}-{}-{}", now_unix_millis(), std::process::id(), cmd);
+    let payload = json!({
+        "Id": "dragonfruit",
+        "Data": {
+            "Cmd": cmd,
+            "Data": data,
+            "RequestID": request_id,
+            "MainboardID": mainboard_id,
+            "TimeStamp": now_unix_seconds(),
+            "From": 0
+        },
+        "Topic": format!("sdcp/request/{mainboard_id}")
+    });
+
+    if cmd == 386 {
+        eprintln!(
+            "[SDCP][Webcam] sending cmd={} host={} port={} request_id={} timeout_ms={} payload={}",
+            cmd,
+            host,
+            port,
+            request_id,
+            effective_timeout_ms,
+            payload
+        );
+    }
+
+    let _ = socket.send(Message::Text("ping".into()));
+    let _ = socket.send(Message::Text(payload.to_string().into()));
+
+    let started = Instant::now();
+    let deadline = Duration::from_millis(effective_timeout_ms);
+    let expected_topic_prefix = format!("sdcp/response/{}", mainboard_id.to_lowercase());
+
+    while started.elapsed() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if !topic.starts_with(&expected_topic_prefix) {
+                    continue;
+                }
+
+                let frame_cmd = frame.pointer("/Data/Cmd").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                if frame_cmd != cmd {
+                    continue;
+                }
+
+                let frame_request_id = frame
+                    .pointer("/Data/RequestID")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if frame_request_id != request_id {
+                    continue;
+                }
+
+                if cmd == 386 {
+                    let ack = frame
+                        .pointer("/Data/Data/Ack")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+                    eprintln!(
+                        "[SDCP][Webcam] received response cmd={} host={} port={} request_id={} ack={} elapsed_ms={}",
+                        cmd,
+                        host,
+                        port,
+                        request_id,
+                        ack,
+                        started.elapsed().as_millis()
+                    );
+                }
+
+                return Some(frame);
+            }
+            Ok(Message::Binary(data)) => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if !topic.starts_with(&expected_topic_prefix) {
+                    continue;
+                }
+
+                let frame_cmd = frame.pointer("/Data/Cmd").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                if frame_cmd != cmd {
+                    continue;
+                }
+
+                let frame_request_id = frame
+                    .pointer("/Data/RequestID")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if frame_request_id != request_id {
+                    continue;
+                }
+
+                if cmd == 386 {
+                    let ack = frame
+                        .pointer("/Data/Data/Ack")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+                    eprintln!(
+                        "[SDCP][Webcam] received binary response cmd={} host={} port={} request_id={} ack={} elapsed_ms={}",
+                        cmd,
+                        host,
+                        port,
+                        request_id,
+                        ack,
+                        started.elapsed().as_millis()
+                    );
+                }
+
+                return Some(frame);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if cmd == 386 {
+                    eprintln!(
+                        "[SDCP][Webcam] socket read error cmd={} host={} port={} request_id={} elapsed_ms={} error={}",
+                        cmd,
+                        host,
+                        port,
+                        request_id,
+                        started.elapsed().as_millis(),
+                        err
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    if cmd == 386 {
+        eprintln!(
+            "[SDCP][Webcam] command timeout/no-response cmd={} host={} port={} request_id={} timeout_ms={} elapsed_ms={}",
+            cmd,
+            host,
+            port,
+            request_id,
+            effective_timeout_ms,
+            started.elapsed().as_millis()
+        );
+    }
+
+    None
+}
+
+fn request_sdcp_status_and_attributes(
+    host: &str,
+    port: u16,
+    mainboard_id: &str,
+    timeout_ms: u64,
+) -> (Option<Value>, Option<Value>) {
+    let url = format!("ws://{host}:{port}/websocket");
+    let Ok((mut socket, _)) = tungstenite::connect(url.as_str()) else {
+        return (None, None);
+    };
+
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms.clamp(900, 7000))));
+    }
+
+    let _ = socket.send(Message::Text("ping".into()));
+
+    let status_request = json!({
+        "Id": "dragonfruit",
+        "Data": {
+            "Cmd": 0,
+            "Data": {},
+            "RequestID": format!("sdcp-status-{}", now_unix_seconds()),
+            "MainboardID": mainboard_id,
+            "TimeStamp": now_unix_seconds(),
+            "From": 0
+        },
+        "Topic": format!("sdcp/request/{mainboard_id}")
+    });
+    let attr_request = json!({
+        "Id": "dragonfruit",
+        "Data": {
+            "Cmd": 1,
+            "Data": {},
+            "RequestID": format!("sdcp-attr-{}", now_unix_seconds()),
+            "MainboardID": mainboard_id,
+            "TimeStamp": now_unix_seconds(),
+            "From": 0
+        },
+        "Topic": format!("sdcp/request/{mainboard_id}")
+    });
+    let _ = socket.send(Message::Text(status_request.to_string().into()));
+    let _ = socket.send(Message::Text(attr_request.to_string().into()));
+
+    let started = Instant::now();
+    let deadline = Duration::from_millis(timeout_ms.clamp(900, 7000));
+    let status_prefix = format!("sdcp/status/{}", mainboard_id.to_lowercase());
+    let attr_prefix = format!("sdcp/attributes/{}", mainboard_id.to_lowercase());
+    let mut status_frame: Option<Value> = None;
+    let mut attributes_frame: Option<Value> = None;
+
+    while started.elapsed() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if topic.starts_with(&status_prefix) {
+                    status_frame = Some(frame);
+                } else if topic.starts_with(&attr_prefix) {
+                    attributes_frame = Some(frame);
+                }
+                if status_frame.is_some() && attributes_frame.is_some() {
+                    break;
+                }
+            }
+            Ok(Message::Binary(data)) => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if topic.starts_with(&status_prefix) {
+                    status_frame = Some(frame);
+                } else if topic.starts_with(&attr_prefix) {
+                    attributes_frame = Some(frame);
+                }
+                if status_frame.is_some() && attributes_frame.is_some() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    (status_frame, attributes_frame)
+}
+
+fn request_sdcp_attributes(
+    host: &str,
+    port: u16,
+    mainboard_id: &str,
+    timeout_ms: u64,
+) -> Option<Value> {
+    let url = format!("ws://{host}:{port}/websocket");
+    let Ok((mut socket, _)) = tungstenite::connect(url.as_str()) else {
+        return None;
+    };
+
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms.clamp(700, 7000))));
+    }
+
+    let _ = socket.send(Message::Text("ping".into()));
+
+    let request_id = format!("sdcp-attr-{}-{}", now_unix_millis(), std::process::id());
+    let attr_request = json!({
+        "Id": "dragonfruit",
+        "Data": {
+            "Cmd": 1,
+            "Data": {},
+            "RequestID": request_id,
+            "MainboardID": mainboard_id,
+            "TimeStamp": now_unix_seconds(),
+            "From": 0
+        },
+        "Topic": format!("sdcp/request/{mainboard_id}")
+    });
+    let _ = socket.send(Message::Text(attr_request.to_string().into()));
+
+    let started = Instant::now();
+    let deadline = Duration::from_millis(timeout_ms.clamp(700, 7000));
+    let attr_prefix = format!("sdcp/attributes/{}", mainboard_id.to_lowercase());
+
+    while started.elapsed() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if !topic.starts_with(&attr_prefix) {
+                    continue;
+                }
+
+                let frame_cmd = frame.pointer("/Data/Cmd").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                if frame_cmd != 1 {
+                    continue;
+                }
+
+                return Some(frame);
+            }
+            Ok(Message::Binary(data)) => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if text.trim().eq_ignore_ascii_case("pong") {
+                    continue;
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let topic = frame_topic_lower(&frame);
+                if !topic.starts_with(&attr_prefix) {
+                    continue;
+                }
+
+                let frame_cmd = frame.pointer("/Data/Cmd").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+                if frame_cmd != 1 {
+                    continue;
+                }
+
+                return Some(frame);
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    None
+}
+
+fn extract_sdcp_video_stream_capacity_from_attributes(
+    attributes_frame: Option<&Value>,
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let connected = attributes_frame
+        .and_then(|frame| frame.pointer("/Data/Attributes/NumberOfVideoStreamConnected"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|v| v as i64)));
+    let maximum = attributes_frame
+        .and_then(|frame| frame.pointer("/Data/Attributes/MaximumVideoStreamAllowed"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|v| v as i64)));
+    let camera_status = attributes_frame
+        .and_then(|frame| frame.pointer("/Data/Attributes/CameraStatus"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|v| v as i64)));
+
+    (connected, maximum, camera_status)
+}
+
+fn fetch_sdcp_video_stream_capacity(
+    host: &str,
+    port: u16,
+    mainboard_id: &str,
+    timeout_ms: u64,
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let attributes_frame = request_sdcp_attributes(host, port, mainboard_id, timeout_ms);
+    extract_sdcp_video_stream_capacity_from_attributes(attributes_frame.as_ref())
+}
+
+fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
+    let print_info = status_frame
+        .and_then(|f| f.pointer("/Data/Status/PrintInfo"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let print_status = print_info.get("Status").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let current_layer = print_info.get("CurrentLayer").and_then(|v| v.as_i64());
+    let total_layers = print_info.get("TotalLayer").and_then(|v| v.as_i64());
+    let current_ticks = print_info.get("CurrentTicks").and_then(|v| v.as_i64());
+    let total_ticks = print_info.get("TotalTicks").and_then(|v| v.as_i64());
+    let filename = print_info
+        .get("Filename")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let task_id = print_info
+        .get("TaskId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let progress_from_layer = match (current_layer, total_layers) {
+        (Some(current), Some(total)) if total > 0 => {
+            Some(((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+        }
+        _ => None,
+    };
+    let progress_from_ticks = match (current_ticks, total_ticks) {
+        (Some(current), Some(total)) if total > 0 => {
+            Some(((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+        }
+        _ => None,
+    };
+    let eta_sec = match (current_ticks, total_ticks) {
+        (Some(current), Some(total)) if total >= current => Some(((total - current) / 1000).max(0)),
+        _ => None,
+    };
+
+    let (state_text, state, is_printing, is_paused) = match print_status {
+        0 => ("Idle", "idle", false, false),
+        1..=5 => ("Printing", "printing", true, false),
+        6 => ("Paused", "paused", true, true),
+        7 => ("Stopping", "canceling", false, false),
+        8 | 9 => ("Idle", "idle", false, false),
+        10 => ("Processing", "processing", false, false),
+        _ => ("Online", "online", false, false),
+    };
+
+    json!({
+        "stateText": state_text,
+        "state": state,
+        "isPrinting": is_printing,
+        "isPaused": is_paused,
+        "progressPct": progress_from_layer.or(progress_from_ticks),
+        "currentLayer": current_layer,
+        "totalLayers": total_layers,
+        "etaSec": eta_sec,
+        "jobName": filename,
+        "taskId": task_id,
+    })
+}
+
 fn discover_sdcp_devices_via_udp(timeout_ms: u64) -> Vec<Value> {
     let socket = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(socket) => socket,
@@ -619,6 +2055,481 @@ async fn sdcp_discover(payload: &Value) -> (u16, Value) {
     )
 }
 
+async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => {
+            return (
+                400,
+                json!({
+                    "ok": false,
+                    "connected": false,
+                    "error": "Invalid host or IP address",
+                }),
+            )
+        }
+    };
+
+    let port = resolve_port(payload.get("port"), parsed.1);
+    match probe_sdcp_host(&parsed.0, port, 2500).await {
+        Some(device) => {
+            let enriched = enrich_sdcp_device_identity_via_websocket(device, 1400);
+            let payload_mainboard = payload
+                .get("mainboardId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+                payload_mainboard
+            } else {
+                resolve_mainboard_id_for_host(&parsed.0, port).await
+            };
+
+            let (status_frame, attributes_frame) = if mainboard_id.is_empty() {
+                (None, None)
+            } else {
+                request_sdcp_status_and_attributes(&parsed.0, port, &mainboard_id, 2800)
+            };
+
+            let print_info = extract_print_info_from_status_frame(status_frame.as_ref());
+            let firmware_from_attrs = attributes_frame
+                .as_ref()
+                .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "connected": true,
+                    "mode": "sdcp",
+                    "hostName": enriched.get("hostName").cloned().unwrap_or(Value::String(parsed.0.clone())),
+                    "printerName": enriched.get("printerName").cloned().unwrap_or(Value::String("SDCP Printer".to_string())),
+                    "printerModel": enriched.get("printerModel").cloned().unwrap_or(Value::String("SDCP 3.0.0".to_string())),
+                    "ipAddress": enriched.get("ipAddress").cloned().unwrap_or(Value::String(parsed.0.clone())),
+                    "port": port,
+                    "mainboardId": mainboard_id,
+                    "firmwareVersion": if firmware_from_attrs.is_empty() {
+                        enriched.get("firmwareVersion").cloned().unwrap_or(Value::String("".to_string()))
+                    } else {
+                        Value::String(firmware_from_attrs)
+                    },
+                    "stateText": print_info.get("stateText").cloned().unwrap_or_else(|| enriched.get("statusText").cloned().unwrap_or(Value::String("Online".to_string()))),
+                    "statusText": enriched.get("statusText").cloned().unwrap_or(Value::String("Online".to_string())),
+                    "state": print_info.get("state").cloned().unwrap_or_else(|| enriched.get("state").cloned().unwrap_or(Value::String("online".to_string()))),
+                    "isPrinting": print_info.get("isPrinting").cloned().unwrap_or(Value::Bool(false)),
+                    "isPaused": print_info.get("isPaused").cloned().unwrap_or(Value::Bool(false)),
+                    "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
+                    "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
+                    "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
+                    "plateId": print_info
+                        .get("taskId")
+                        .and_then(|v| v.as_str())
+                        .map(|v| Value::from(hash_plate_id_from_path(v)))
+                        .unwrap_or(Value::Null),
+                    "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
+                    "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
+                }),
+            )
+        }
+        None => (
+            503,
+            json!({
+                "ok": false,
+                "connected": false,
+                "mode": "sdcp",
+                "hostName": parsed.0,
+                "printerName": "",
+                "ipAddress": parsed.0,
+                "port": port,
+                "stateText": "Offline",
+                "statusText": "SDCP host unreachable",
+                "state": "offline",
+                "isPrinting": false,
+                "isPaused": false,
+                "progressPct": Value::Null,
+                "currentLayer": Value::Null,
+                "totalLayers": Value::Null,
+                "plateId": Value::Null,
+                "jobName": Value::Null,
+                "etaSec": Value::Null,
+            }),
+        ),
+    }
+}
+
+async fn sdcp_plates_list(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => {
+            return (
+                400,
+                json!({ "ok": false, "metadataReady": false, "error": "Invalid host or IP address", "plates": [] }),
+            )
+        }
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+
+    if mainboard_id.is_empty() {
+        return (
+            200,
+            json!({
+                "ok": false,
+                "metadataReady": false,
+                "error": "Unable to resolve SDCP mainboard ID for file list command.",
+                "matchedPlate": Value::Null,
+                "plates": [],
+            }),
+        );
+    }
+
+    let response = send_sdcp_command_and_await_response(
+        &parsed.0,
+        port,
+        &mainboard_id,
+        258,
+        json!({ "Url": "/local/" }),
+        3200,
+    );
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+
+    let files = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/FileList"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut plates: Vec<Value> = Vec::new();
+    for file in files {
+        let file_type = file.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if file_type != 1 {
+            continue;
+        }
+
+        let full_path = file
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if full_path.is_empty() {
+            continue;
+        }
+        let plate_name = full_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or(full_path.as_str())
+            .to_string();
+        let plate_id = hash_plate_id_from_path(&full_path);
+
+        plates.push(json!({
+            "PlateID": plate_id,
+            "plateId": plate_id,
+            "Path": full_path,
+            "path": full_path,
+            "Name": plate_name,
+            "name": plate_name,
+        }));
+    }
+
+    let requested_plate_id = payload.get("plateId").and_then(|v| v.as_i64());
+    let requested_job = payload
+        .get("jobName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    let matched_plate = plates.iter().find(|plate| {
+        if let Some(id) = requested_plate_id {
+            return plate
+                .get("PlateID")
+                .and_then(|v| v.as_i64())
+                .map(|pid| pid == id)
+                .unwrap_or(false);
+        }
+
+        if !requested_job.is_empty() {
+            let path = plate
+                .get("Path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let name = plate
+                .get("Name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            return path.contains(&requested_job) || name.contains(&requested_job);
+        }
+
+        false
+    }).cloned();
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "metadataReady": matched_plate.is_some() || requested_job.is_empty(),
+            "matchedPlate": matched_plate.unwrap_or(Value::Null),
+            "plates": plates,
+            "error": if ack == 0 { Value::Null } else { Value::String("SDCP file list request failed.".to_string()) },
+        }),
+    )
+}
+
+async fn sdcp_webcam_info(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => {
+            return (
+                400,
+                json!({ "ok": false, "available": false, "message": "Invalid host or IP address" }),
+            )
+        }
+    };
+
+    let port = resolve_port(payload.get("port"), parsed.1);
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let key_mainboard = if payload_mainboard.is_empty() {
+        "passive-rtsp".to_string()
+    } else {
+        payload_mainboard
+    };
+    let cache_key = webcam_cache_key(&parsed.0, port, &key_mainboard);
+
+    if let Some((effective_stream_url, cached_external_url, cached_proxied)) =
+        read_cached_webcam_urls(&cache_key)
+    {
+        let cached_external_is_rtsp = cached_external_url.starts_with("rtsp://")
+            || cached_external_url.starts_with("rtsps://");
+
+        if cached_external_is_rtsp {
+            let (_, proxy_body) = sdcp_rtsp_proxy_start(&json!({ "rtspUrl": cached_external_url.clone() }));
+            if proxy_body
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                let proxy_url = proxy_body
+                    .get("proxyUrl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !proxy_url.is_empty() {
+                    store_cached_webcam_urls(
+                        &cache_key,
+                        &cached_external_url,
+                        Some(proxy_url.clone()),
+                    );
+                    return (
+                        200,
+                        json!({
+                            "ok": true,
+                            "available": true,
+                            "streamUrl": Value::String(proxy_url),
+                            "externalStreamUrl": Value::String(cached_external_url),
+                            "snapshotUrl": Value::Null,
+                            "message": "Using cached SDCP RTSP stream with local proxy for inline monitor preview.".to_string(),
+                        }),
+                    );
+                }
+            }
+
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "available": true,
+                    "streamUrl": Value::String(cached_external_url.clone()),
+                    "externalStreamUrl": Value::String(cached_external_url),
+                    "snapshotUrl": Value::Null,
+                    "message": "Using cached SDCP RTSP stream directly.".to_string(),
+                }),
+            );
+        }
+
+        return (
+            200,
+            json!({
+                "ok": true,
+                "available": true,
+                "streamUrl": Value::String(effective_stream_url),
+                "externalStreamUrl": Value::String(cached_external_url),
+                "snapshotUrl": Value::Null,
+                "message": if cached_proxied {
+                    "Using cached proxied SDCP webcam stream for inline monitor preview.".to_string()
+                } else {
+                    "Using cached SDCP webcam stream.".to_string()
+                },
+            }),
+        );
+    }
+
+    let direct_rtsp_url = format!("rtsp://{}:554/video", parsed.0);
+    let mut effective_stream_url = direct_rtsp_url.clone();
+    let mut proxied = false;
+
+    let (_, proxy_body) = sdcp_rtsp_proxy_start(&json!({ "rtspUrl": direct_rtsp_url.clone() }));
+    if proxy_body
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let proxy_url = proxy_body
+            .get("proxyUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !proxy_url.is_empty() {
+            effective_stream_url = proxy_url;
+            proxied = true;
+        }
+    }
+
+    store_cached_webcam_urls(
+        &cache_key,
+        &direct_rtsp_url,
+        if proxied {
+            Some(effective_stream_url.clone())
+        } else {
+            None
+        },
+    );
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "available": true,
+            "streamUrl": Value::String(effective_stream_url),
+            "externalStreamUrl": Value::String(direct_rtsp_url),
+            "snapshotUrl": Value::Null,
+            "message": if proxied {
+                "Using direct SDCP RTSP stream through local proxy for inline monitor preview.".to_string()
+            } else {
+                "Using direct SDCP RTSP stream (no camera control command sent).".to_string()
+            },
+        }),
+    )
+}
+
+async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+    if mainboard_id.is_empty() {
+        return (200, json!({ "ok": false, "error": "Unable to resolve SDCP mainboard ID for control command." }));
+    }
+
+    let mut data = json!({});
+    if cmd == 128 {
+        let filename = payload
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let job_name = payload
+            .get("jobName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let resolved_filename = if !filename.is_empty() {
+            filename
+        } else if !job_name.is_empty() {
+            let base = job_name.rsplit_once('.').map(|(b, _)| b).unwrap_or(job_name.as_str());
+            format!("{base}.ctb")
+        } else {
+            String::new()
+        };
+
+        if resolved_filename.is_empty() {
+            return (
+                400,
+                json!({
+                    "ok": false,
+                    "error": "Start printing requires filename or jobName for SDCP Cmd 128.",
+                }),
+            );
+        }
+
+        data = json!({
+            "Filename": resolved_filename,
+            "StartLayer": 0
+        });
+    }
+
+    let response = send_sdcp_command_and_await_response(&parsed.0, port, &mainboard_id, cmd, data, 3200);
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "ack": ack,
+            "message": if ack == 0 {
+                format!("SDCP command {op_label} accepted.")
+            } else {
+                format!("SDCP command {op_label} rejected (Ack {}).", if ack < 0 { "unknown".to_string() } else { ack.to_string() })
+            },
+            "error": if ack == 0 { Value::Null } else { Value::String(format!("SDCP {op_label} failed.")) },
+        }),
+    )
+}
+
 fn unsupported_operation_response(operation: &str) -> (u16, Value) {
     (
         404,
@@ -638,6 +2549,18 @@ async fn handle_sdcp_network(operation: &str, payload: &Value) -> (u16, Value) {
     match op {
         "connect" => sdcp_connect(payload).await,
         "discover" => sdcp_discover(payload).await,
+        "printer/status" => sdcp_printer_status(payload).await,
+        "printer/webcam/info" => sdcp_webcam_info(payload).await,
+        "rtsp/proxy/start" => sdcp_rtsp_proxy_start(payload),
+        "rtsp/proxy/stop" => sdcp_rtsp_proxy_stop(payload),
+        "ffmpeg/install" => sdcp_ffmpeg_install(payload).await,
+        "plates/list/json" => sdcp_plates_list(payload).await,
+        "printer/start" => sdcp_control_operation(payload, 128, op).await,
+        "printer/pause" => sdcp_control_operation(payload, 129, op).await,
+        "printer/stop" | "printer/force-stop" => sdcp_control_operation(payload, 130, op).await,
+        "printer/unpause" => sdcp_control_operation(payload, 131, op).await,
+        "upload/chunk" => sdcp_upload_chunk(payload).await,
+        "plate/delete" => unsupported_operation_response(op),
         "materials" | "materials/edit" | "unsupported" => unsupported_operation_response(op),
         _ => (
             404,

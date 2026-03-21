@@ -1,3 +1,5 @@
+import { pluginNetworkFetch } from '@/utils/pluginNetworkBridge';
+
 type UploadProgressEvent = {
   loaded: number;
   total: number;
@@ -69,24 +71,38 @@ async function uploadSdcpChunk(args: {
   chunk: Blob;
 }): Promise<void> {
   const { hostUrl, uuid, fileName, totalSize, offset, chunk } = args;
-  const form = new FormData();
+  const parsed = new URL(hostUrl);
+  const chunkBase64 = (() => {
+    return chunk.arrayBuffer().then((buffer) => {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const step = 0x8000;
+      for (let i = 0; i < bytes.length; i += step) {
+        const view = bytes.subarray(i, i + step);
+        binary += String.fromCharCode(...view);
+      }
+      return btoa(binary);
+    });
+  })();
 
-  // SDCP v3 endpoint expects these multipart form fields for chunked upload.
-  form.set('S-File-MD5', '');
-  form.set('Check', '0');
-  form.set('Offset', String(offset));
-  form.set('Uuid', uuid);
-  form.set('TotalSize', String(totalSize));
-  form.set('File', chunk, fileName);
-
-  const response = await fetch(`${hostUrl}/uploadFile/upload`, {
-    method: 'POST',
-    body: form,
-    cache: 'no-store',
+  const response = await pluginNetworkFetch({
+    pluginId: 'sdcp-v3',
+    operation: 'sdcp/upload/chunk',
+    host: parsed.hostname,
+    port: parsed.port ? Number(parsed.port) : DEFAULT_SDCP_PORT,
+    uuid,
+    fileName,
+    totalSize,
+    offset,
+    chunkBase64: await chunkBase64,
   });
 
-  if (!response.ok) {
-    throw new Error(`SDCP upload chunk failed (HTTP ${response.status})`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !(body as any)?.ok) {
+    const error = typeof (body as any)?.error === 'string'
+      ? (body as any).error
+      : `SDCP upload chunk failed (HTTP ${response.status})`;
+    throw new Error(error);
   }
 }
 
