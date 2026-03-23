@@ -51,6 +51,14 @@ const SDCP_MONITORING_ADAPTER: PluginMonitoringUiAdapterContract = {
   },
   parseStatusPayload: (payload: unknown) => resolveSdcpMonitoringSnapshot(payload),
   parseWebcamInfoPayload: (payload: unknown, host: string, port: number) => resolveSdcpWebcamFeedInfo(payload, host, port),
+  getMonitoringUiPolicy: () => ({
+    busyResponseGraceMs: 30_000,
+    inconclusiveReachabilityMaxPolls: 2,
+    supportsWebcamStreamSlotReset: true,
+    webcamMaxConsecutiveTimeouts: 3,
+    webcamTimeoutCooldownMs: 20_000,
+    webcamFailureCooldownMs: 8_000,
+  }),
 };
 
 export const SDCP_V3_COMPLEX_PLUGIN_DEFINITION: ComplexPluginDefinition = {
