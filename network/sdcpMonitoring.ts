@@ -83,7 +83,18 @@ function coerceBool(value: unknown): boolean | null {
 
 export function resolveSdcpMonitoringSnapshot(payload: unknown): SdcpMonitoringSnapshot {
   const root = (payload ?? {}) as UnknownRecord;
-  const connected = root.ok === false ? false : toBoolean(root.connected ?? true);
+  const hasError = typeof root.error === 'string' && root.error.trim().length > 0;
+  const hasExplicitConnected = Object.prototype.hasOwnProperty.call(root, 'connected');
+  const hasExplicitOk = Object.prototype.hasOwnProperty.call(root, 'ok');
+  const connected = hasError
+    ? false
+    : root.ok === false
+      ? false
+      : hasExplicitConnected
+        ? toBoolean(root.connected)
+        : hasExplicitOk
+          ? toBoolean(root.ok)
+          : toBoolean(root.connected ?? true);
 
   const stateTextRaw = [
     root.stateText,

@@ -251,8 +251,27 @@ function getFrameMainboardId(frame: SdcpWsFrame | null | undefined): string {
   return looksLikeMainboardId(lastSegment) ? lastSegment : '';
 }
 
+async function resolveSdcpDeviceViaDiscovery(host: string, timeoutMs: number): Promise<SdcpDiscoveredDevice | null> {
+  const normalizedTarget = host.trim().toLowerCase();
+  if (!normalizedTarget) return null;
+
+  const devices = await discoverSdcpDevicesViaUdp(Math.max(600, Math.min(timeoutMs, 4000)));
+  return devices.find((device) => {
+    const ipMatches = device.ipAddress.trim().toLowerCase() === normalizedTarget;
+    const hostMatches = device.hostName.trim().toLowerCase() === normalizedTarget;
+    return ipMatches || hostMatches;
+  }) ?? null;
+}
+
 async function resolveMainboardIdForHost(host: string, port: number): Promise<string> {
   const wsDiscovered = await resolveMainboardIdViaWebSocket(host, port, 1800);
+  const discovery = await resolveSdcpDeviceViaDiscovery(host, 1800);
+  if (discovery) {
+    const candidate = discovery.hostName?.trim() ?? '';
+    if (looksLikeMainboardId(candidate)) {
+      return candidate;
+    }
+  }
   if (looksLikeMainboardId(wsDiscovered)) return wsDiscovered;
 
   const udpDiscovered = await resolveMainboardIdViaUdp(host, 1400);
@@ -1007,9 +1026,35 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   }
 
   const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const discovery = await resolveSdcpDeviceViaDiscovery(parsedHost.host, 1800);
+  if (!discovery) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        connected: false,
+        mode: 'sdcp',
+        hostName: parsedHost.host,
+        printerName: '',
+        ipAddress: parsedHost.host,
+        port,
+        stateText: 'Offline',
+        statusText: 'SDCP discovery did not respond',
+        state: 'offline',
+        isPrinting: false,
+        isPaused: false,
+        progressPct: null,
+        currentLayer: null,
+        totalLayers: null,
+        plateId: null,
+        jobName: null,
+        etaSec: null,
+      },
+    };
+  }
   const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
     ? String((payload as any).mainboardId).trim()
-    : await resolveMainboardIdForHost(parsedHost.host, port);
+    : (looksLikeMainboardId(discovery.hostName) ? discovery.hostName.trim() : await resolveMainboardIdForHost(parsedHost.host, port));
   const telemetry = mainboardId
     ? await requestSdcpStatusAndAttributes({ host: parsedHost.host, port, mainboardId, timeoutMs: 6500 })
     : { statusFrame: null, attributesFrame: null };

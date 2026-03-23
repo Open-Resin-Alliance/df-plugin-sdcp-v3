@@ -472,6 +472,28 @@ fn hash_plate_id_from_path(path: &str) -> i64 {
     if normalized <= 0 { 1 } else { normalized }
 }
 
+    fn resolve_sdcp_device_via_udp_discovery(host: &str, timeout_ms: u64) -> Option<Value> {
+        let normalized_host = host.trim().to_lowercase();
+        if normalized_host.is_empty() {
+            return None;
+        }
+
+        let devices = discover_sdcp_devices_via_udp(timeout_ms);
+        devices.into_iter().find(|device| {
+            let ip_matches = device
+                .get("ipAddress")
+                .and_then(|v| v.as_str())
+                .map(|ip| ip.trim().eq_ignore_ascii_case(&normalized_host))
+                .unwrap_or(false);
+            let name_matches = device
+                .get("hostName")
+                .and_then(|v| v.as_str())
+                .map(|name| name.trim().eq_ignore_ascii_case(&normalized_host))
+                .unwrap_or(false);
+            ip_matches || name_matches
+        })
+    }
+
 fn frame_topic_lower(frame: &Value) -> String {
     frame
         .get("Topic")
@@ -482,6 +504,18 @@ fn frame_topic_lower(frame: &Value) -> String {
 }
 
 async fn resolve_mainboard_id_for_host(host: &str, port: u16) -> String {
+    if let Some(device) = resolve_sdcp_device_via_udp_discovery(host, 1800) {
+        let candidate = device
+            .get("hostName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if looks_like_mainboard_id(&candidate) {
+            return candidate;
+        }
+    }
+
     let ws_discovered = resolve_mainboard_id_via_websocket(host, port, 1800);
     if looks_like_mainboard_id(&ws_discovered) {
         return ws_discovered;
@@ -1214,157 +1248,106 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     };
 
     let port = resolve_port(payload.get("port"), parsed.1);
-    match probe_sdcp_host(&parsed.0, port, SDCP_STATUS_PROBE_TIMEOUT_MS).await {
-        Some(device) => {
-            let enriched = enrich_sdcp_device_identity_via_websocket(device, 1400);
-            let payload_mainboard = payload
-                .get("mainboardId")
+    let discovery = resolve_sdcp_device_via_udp_discovery(&parsed.0, 1800);
+    let Some(device) = discovery else {
+        return (
+            503,
+            json!({
+                "ok": false,
+                "connected": false,
+                "mode": "sdcp",
+                "hostName": parsed.0,
+                "printerName": "",
+                "ipAddress": parsed.0,
+                "port": port,
+                "stateText": "Offline",
+                "statusText": "SDCP discovery did not respond",
+                "state": "offline",
+                "isPrinting": false,
+                "isPaused": false,
+                "progressPct": Value::Null,
+                "currentLayer": Value::Null,
+                "totalLayers": Value::Null,
+                "plateId": Value::Null,
+                "jobName": Value::Null,
+                "etaSec": Value::Null,
+            }),
+        );
+    };
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let discovery_mainboard = device
+        .get("hostName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else if looks_like_mainboard_id(&discovery_mainboard) {
+        discovery_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+
+    let (status_frame, attributes_frame) = if mainboard_id.is_empty() {
+        (None, None)
+    } else {
+        request_sdcp_status_and_attributes(&parsed.0, port, &mainboard_id, SDCP_STATUS_WS_TIMEOUT_MS)
+    };
+
+    let print_info = extract_print_info_from_status_frame(status_frame.as_ref());
+    let firmware_from_attrs = attributes_frame
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let state_text = print_info.get("stateText").cloned().unwrap_or_else(|| {
+        device.get("statusText").cloned().unwrap_or(Value::String("Online".to_string()))
+    });
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "connected": true,
+            "mode": "sdcp",
+            "hostName": device.get("hostName").cloned().unwrap_or(Value::String(parsed.0.clone())),
+            "printerName": device.get("printerName").cloned().unwrap_or(Value::String("SDCP Printer".to_string())),
+            "printerModel": device.get("printerModel").cloned().unwrap_or(Value::String("SDCP 3.0.0".to_string())),
+            "ipAddress": device.get("ipAddress").cloned().unwrap_or(Value::String(parsed.0.clone())),
+            "port": port,
+            "mainboardId": mainboard_id,
+            "firmwareVersion": if firmware_from_attrs.is_empty() {
+                device.get("firmwareVersion").cloned().unwrap_or(Value::String("".to_string()))
+            } else {
+                Value::String(firmware_from_attrs)
+            },
+            "stateText": state_text,
+            "statusText": device.get("statusText").cloned().unwrap_or(Value::String("Online".to_string())),
+            "state": print_info.get("state").cloned().unwrap_or_else(|| device.get("state").cloned().unwrap_or(Value::String("online".to_string()))),
+            "isPrinting": print_info.get("isPrinting").cloned().unwrap_or(Value::Bool(false)),
+            "isPaused": print_info.get("isPaused").cloned().unwrap_or(Value::Bool(false)),
+            "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
+            "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
+            "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
+            "plateId": print_info
+                .get("taskId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
-                payload_mainboard
-            } else {
-                resolve_mainboard_id_for_host(&parsed.0, port).await
-            };
-
-            let (status_frame, attributes_frame) = if mainboard_id.is_empty() {
-                (None, None)
-            } else {
-                request_sdcp_status_and_attributes(&parsed.0, port, &mainboard_id, SDCP_STATUS_WS_TIMEOUT_MS)
-            };
-
-            let print_info = extract_print_info_from_status_frame(status_frame.as_ref());
-            let firmware_from_attrs = attributes_frame
-                .as_ref()
-                .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            (
-                200,
-                json!({
-                    "ok": true,
-                    "connected": true,
-                    "mode": "sdcp",
-                    "hostName": enriched.get("hostName").cloned().unwrap_or(Value::String(parsed.0.clone())),
-                    "printerName": enriched.get("printerName").cloned().unwrap_or(Value::String("SDCP Printer".to_string())),
-                    "printerModel": enriched.get("printerModel").cloned().unwrap_or(Value::String("SDCP 3.0.0".to_string())),
-                    "ipAddress": enriched.get("ipAddress").cloned().unwrap_or(Value::String(parsed.0.clone())),
-                    "port": port,
-                    "mainboardId": mainboard_id,
-                    "firmwareVersion": if firmware_from_attrs.is_empty() {
-                        enriched.get("firmwareVersion").cloned().unwrap_or(Value::String("".to_string()))
-                    } else {
-                        Value::String(firmware_from_attrs)
-                    },
-                    "stateText": print_info.get("stateText").cloned().unwrap_or_else(|| enriched.get("statusText").cloned().unwrap_or(Value::String("Online".to_string()))),
-                    "statusText": enriched.get("statusText").cloned().unwrap_or(Value::String("Online".to_string())),
-                    "state": print_info.get("state").cloned().unwrap_or_else(|| enriched.get("state").cloned().unwrap_or(Value::String("online".to_string()))),
-                    "isPrinting": print_info.get("isPrinting").cloned().unwrap_or(Value::Bool(false)),
-                    "isPaused": print_info.get("isPaused").cloned().unwrap_or(Value::Bool(false)),
-                    "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
-                    "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
-                    "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
-                    "plateId": print_info
-                        .get("taskId")
-                        .and_then(|v| v.as_str())
-                        .map(|v| Value::from(hash_plate_id_from_path(v)))
-                        .unwrap_or(Value::Null),
-                    "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
-                    "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
-                }),
-            )
-        }
-        None => {
-            let payload_mainboard = payload
-                .get("mainboardId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
-                payload_mainboard
-            } else {
-                resolve_mainboard_id_for_host(&parsed.0, port).await
-            };
-
-            let (status_frame, attributes_frame) = if mainboard_id.is_empty() {
-                (None, None)
-            } else {
-                request_sdcp_status_and_attributes(&parsed.0, port, &mainboard_id, SDCP_STATUS_WS_TIMEOUT_MS)
-            };
-
-            if status_frame.is_some() || attributes_frame.is_some() {
-                let print_info = extract_print_info_from_status_frame(status_frame.as_ref());
-                let firmware_from_attrs = attributes_frame
-                    .as_ref()
-                    .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-
-                return (
-                    200,
-                    json!({
-                        "ok": true,
-                        "connected": true,
-                        "mode": "sdcp",
-                        "hostName": parsed.0,
-                        "printerName": "SDCP Printer",
-                        "printerModel": "SDCP 3.0.0",
-                        "ipAddress": parsed.0,
-                        "port": port,
-                        "mainboardId": mainboard_id,
-                        "firmwareVersion": if firmware_from_attrs.is_empty() { Value::String("".to_string()) } else { Value::String(firmware_from_attrs) },
-                        "stateText": print_info.get("stateText").cloned().unwrap_or(Value::String("Online".to_string())),
-                        "statusText": Value::String("SDCP telemetry reachable; HTTP probe timed out.".to_string()),
-                        "state": print_info.get("state").cloned().unwrap_or(Value::String("online".to_string())),
-                        "isPrinting": print_info.get("isPrinting").cloned().unwrap_or(Value::Bool(false)),
-                        "isPaused": print_info.get("isPaused").cloned().unwrap_or(Value::Bool(false)),
-                        "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
-                        "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
-                        "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
-                        "plateId": print_info
-                            .get("taskId")
-                            .and_then(|v| v.as_str())
-                            .map(|v| Value::from(hash_plate_id_from_path(v)))
-                            .unwrap_or(Value::Null),
-                        "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
-                        "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
-                    }),
-                );
-            }
-
-            (
-                503,
-                json!({
-                    "ok": false,
-                    "connected": false,
-                    "mode": "sdcp",
-                    "hostName": parsed.0,
-                    "printerName": "",
-                    "ipAddress": parsed.0,
-                    "port": port,
-                    "stateText": "Offline",
-                    "statusText": "SDCP host unreachable",
-                    "state": "offline",
-                    "isPrinting": false,
-                    "isPaused": false,
-                    "progressPct": Value::Null,
-                    "currentLayer": Value::Null,
-                    "totalLayers": Value::Null,
-                    "plateId": Value::Null,
-                    "jobName": Value::Null,
-                    "etaSec": Value::Null,
-                }),
-            )
-        }
-    }
+                .map(|v| Value::from(hash_plate_id_from_path(v)))
+                .unwrap_or(Value::Null),
+            "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
+            "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
+        }),
+    )
 }
 
 async fn sdcp_plates_list(payload: &Value) -> (u16, Value) {
