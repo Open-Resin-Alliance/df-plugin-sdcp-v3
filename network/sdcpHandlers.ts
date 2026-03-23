@@ -455,16 +455,6 @@ async function sendSdcpCommandAndAwaitResponse(args: {
 
     const effectiveTimeoutMs = Math.max(700, Math.min(timeoutMs, 7000));
     const timer = setTimeout(() => {
-      if (cmd === 386) {
-        console.warn('[SDCP/Webcam] WebSocket command timed out', {
-          host,
-          port,
-          cmd,
-          requestId,
-          timeoutMs: effectiveTimeoutMs,
-          elapsedMs: Date.now() - startedAt,
-        });
-      }
       finish(null);
     }, effectiveTimeoutMs);
 
@@ -1017,8 +1007,50 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   }
 
   const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const probed = await probeSdcpHost(parsedHost.host, port, 2500);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  const telemetry = mainboardId
+    ? await requestSdcpStatusAndAttributes({ host: parsedHost.host, port, mainboardId, timeoutMs: 6500 })
+    : { statusFrame: null, attributesFrame: null };
+  const printInfo = extractPrintInfoFromStatusFrame(telemetry.statusFrame);
+
+  const probed = await probeSdcpHost(parsedHost.host, port, 6500);
   if (!probed) {
+    if (telemetry.statusFrame || telemetry.attributesFrame) {
+      const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
+      const firmwareVersionFromAttrs = typeof attributes?.FirmwareVersion === 'string'
+        ? attributes.FirmwareVersion.trim()
+        : '';
+
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          connected: true,
+          mode: 'sdcp',
+          hostName: parsedHost.host,
+          printerName: 'SDCP Printer',
+          printerModel: 'SDCP 3.0.0',
+          ipAddress: parsedHost.host,
+          port,
+          mainboardId,
+          firmwareVersion: firmwareVersionFromAttrs,
+          stateText: printInfo.stateText || 'Online',
+          statusText: 'SDCP telemetry reachable; HTTP probe timed out.',
+          state: printInfo.state || 'online',
+          isPrinting: printInfo.isPrinting,
+          isPaused: printInfo.isPaused,
+          progressPct: printInfo.progressPct,
+          currentLayer: printInfo.currentLayer,
+          totalLayers: printInfo.totalLayers,
+          plateId: printInfo.taskId ? hashPlateIdFromPath(printInfo.taskId) : null,
+          jobName: printInfo.jobName,
+          etaSec: printInfo.etaSec,
+        },
+      };
+    }
+
     return {
       status: 503,
       body: {
@@ -1045,14 +1077,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   }
 
   const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probed, 1400);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
-    : await resolveMainboardIdForHost(parsedHost.host, port);
-
-  const telemetry = mainboardId
-    ? await requestSdcpStatusAndAttributes({ host: parsedHost.host, port, mainboardId, timeoutMs: 2800 })
-    : { statusFrame: null, attributesFrame: null };
-  const printInfo = extractPrintInfoFromStatusFrame(telemetry.statusFrame);
 
   const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
   const firmwareVersionFromAttrs = typeof attributes?.FirmwareVersion === 'string'
@@ -1098,50 +1122,16 @@ async function handleSdcpWebcamInfo(payload: unknown): Promise<HandlerResult> {
     return { status: 400, body: { ok: false, available: false, message: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
-    : await resolveMainboardIdForHost(parsedHost.host, port);
-  if (!mainboardId) {
-    return {
-      status: 200,
-      body: {
-        ok: false,
-        available: false,
-        streamUrl: null,
-        snapshotUrl: null,
-        message: 'Unable to resolve SDCP mainboard ID for webcam stream command.',
-      },
-    };
-  }
-
-  const response = await sendSdcpCommandAndAwaitResponse({
-    host: parsedHost.host,
-    port,
-    mainboardId,
-    cmd: 386,
-    data: { Enable: 1 },
-    timeoutMs: 3200,
-  });
-
-  const data = (response?.Data?.Data ?? {}) as Record<string, unknown>;
-  const ack = Number(data.Ack);
-  const videoUrl = typeof data.VideoUrl === 'string' ? data.VideoUrl.trim() : '';
+  const directRtspUrl = `rtsp://${parsedHost.host}:554/video`;
 
   return {
     status: 200,
     body: {
-      ok: ack === 0,
-      available: ack === 0 && videoUrl.length > 0,
-      streamUrl: videoUrl || null,
+      ok: true,
+      available: true,
+      streamUrl: directRtspUrl,
       snapshotUrl: null,
-      message: ack === 0
-        ? (videoUrl ? 'RTSP video stream enabled.' : 'Video stream enabled but URL missing.')
-        : ack === 1
-          ? 'Exceeded maximum simultaneous SDCP video stream limit.'
-          : ack === 2
-            ? 'SDCP camera does not exist on this printer.'
-            : 'Failed to enable SDCP video stream.',
+      message: 'Using direct SDCP RTSP stream (no local proxy).',
     },
   };
 }
@@ -1157,70 +1147,17 @@ async function handleSdcpWebcamDisable(payload: unknown): Promise<HandlerResult>
     return { status: 400, body: { ok: false, available: false, message: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
-    : await resolveMainboardIdForHost(parsedHost.host, port);
-  if (!mainboardId) {
-    return {
-      status: 200,
-      body: {
-        ok: false,
-        available: false,
-        streamUrl: null,
-        snapshotUrl: null,
-        message: 'Unable to resolve SDCP mainboard ID for webcam disable command.',
-      },
-    };
-  }
-
-  const response = await sendSdcpCommandAndAwaitResponse({
-    host: parsedHost.host,
-    port,
-    mainboardId,
-    cmd: 386,
-    data: { Enable: 0 },
-    timeoutMs: 3200,
-  });
-
-  const data = (response?.Data?.Data ?? {}) as Record<string, unknown>;
-  const ack = Number(data.Ack);
-
-  const telemetry = ack === 0
-    ? await requestSdcpStatusAndAttributes({
-      host: parsedHost.host,
-      port,
-      mainboardId,
-      timeoutMs: 400,
-    })
-    : { statusFrame: null, attributesFrame: null };
-  const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
-  const connectedStreams = Number(attributes?.NumberOfVideoStreamConnected);
-  const maximumStreams = Number(attributes?.MaximumVideoStreamAllowed);
-  const cameraStatus = Number(attributes?.CameraStatus);
-
-  const hasConnected = Number.isFinite(connectedStreams);
-  const hasMaximum = Number.isFinite(maximumStreams) && maximumStreams > 0;
-
   return {
     status: 200,
     body: {
-      ok: ack === 0 || ack === 1,
+      ok: true,
       available: false,
       streamUrl: null,
       snapshotUrl: null,
-      connectedStreams: hasConnected ? connectedStreams : null,
-      maximumStreams: hasMaximum ? maximumStreams : null,
-      cameraStatus: Number.isFinite(cameraStatus) ? cameraStatus : null,
-      message: ack === 0
-        ? (hasConnected && hasMaximum
-          ? `Requested SDCP webcam stream reset (${connectedStreams} of ${maximumStreams} stream slots currently in use). Retry to reacquire the feed.`
-          : 'Requested SDCP webcam stream reset. Retry to reacquire the feed.')
-        : ack === 1
-          ? 'SDCP reports stream-slot contention while disabling webcam stream. Reset request was sent, but another client may still own the stream slot.'
-        : ack === 2
-          ? 'SDCP camera does not exist on this printer.'
-          : 'Failed to disable SDCP webcam stream.',
+      connectedStreams: null,
+      maximumStreams: null,
+      cameraStatus: null,
+      message: 'SDCP webcam disable is a no-op when using direct RTSP streaming.',
     },
   };
 }
@@ -1376,17 +1313,6 @@ function handleUnsupportedSdcpOperation(op: string): HandlerResult {
   };
 }
 
-function handleSdcpRtspProxyUnsupported(op: string): HandlerResult {
-  return {
-    status: 501,
-    body: {
-      ok: false,
-      error: `Unsupported SDCP operation in web runtime: ${op}`,
-      note: 'RTSP proxy streaming is currently available in the desktop runtime only.',
-    },
-  };
-}
-
 export async function handleSdcpV3NetworkOperation(operationPath: string[], payload: unknown): Promise<HandlerResult> {
   if (operationPath.length === 0 || operationPath[0] !== 'sdcp') {
     return { status: 404, body: { error: 'Unknown SDCP network operation' } };
@@ -1399,7 +1325,6 @@ export async function handleSdcpV3NetworkOperation(operationPath: string[], payl
   if (op === 'printer/status') return handleSdcpPrinterStatus(payload);
   if (op === 'printer/webcam/info') return handleSdcpWebcamInfo(payload);
   if (op === 'printer/webcam/disable') return handleSdcpWebcamDisable(payload);
-  if (op === 'rtsp/proxy/start' || op === 'rtsp/proxy/stop' || op === 'ffmpeg/install') return handleSdcpRtspProxyUnsupported(op);
   if (op === 'plates/list/json') return handleSdcpPlatesList(payload);
   if (op === 'printer/start') return handleSdcpControlOperation(payload, 128, op);
   if (op === 'printer/pause') return handleSdcpControlOperation(payload, 129, op);

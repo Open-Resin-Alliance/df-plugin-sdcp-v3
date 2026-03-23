@@ -61,7 +61,10 @@ function toAbsoluteUrl(candidate: string, host: string, port: number): string | 
 }
 
 function isInlinePreviewUrl(url: string): boolean {
-  return /^https?:\/\//i.test(url) || /^data:/i.test(url) || /^blob:/i.test(url);
+  return /^https?:\/\//i.test(url)
+    || /^wss?:\/\//i.test(url)
+    || /^data:/i.test(url)
+    || /^blob:/i.test(url);
 }
 
 function coerceBool(value: unknown): boolean | null {
@@ -168,7 +171,6 @@ export function resolveSdcpWebcamFeedInfo(payload: unknown, host: string, port: 
   if (!previewable) {
     const normalizedMessage = preferredMessage.toLowerCase();
     const alreadyExplainsProxyFailure = normalizedMessage.includes('proxy failed')
-      || normalizedMessage.includes('ffmpeg')
       || normalizedMessage.includes('not found');
     return {
       available: false,
