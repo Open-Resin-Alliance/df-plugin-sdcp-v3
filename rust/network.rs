@@ -1387,12 +1387,18 @@ async fn sdcp_plates_list(payload: &Value) -> (u16, Value) {
         );
     }
 
+    let storage_path = normalize_sdcp_storage_path(
+        payload.get("storagePath")
+            .or_else(|| payload.get("source"))
+            .or_else(|| payload.get("url")),
+    );
+
     let response = send_sdcp_command_and_await_response(
         &parsed.0,
         port,
         &mainboard_id,
         258,
-        json!({ "Url": "/local/" }),
+        json!({ "Url": storage_path }),
         3200,
     );
     let ack = response
@@ -1562,6 +1568,119 @@ async fn sdcp_webcam_info(payload: &Value) -> (u16, Value) {
     )
 }
 
+fn normalize_sdcp_storage_path(value: Option<&Value>) -> String {
+    let raw = value
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return "/local/".to_string();
+    }
+
+    let lower = raw.to_lowercase();
+    match lower.as_str() {
+        "local" | "/local" => "/local/".to_string(),
+        "usb" | "/usb" => "/usb/".to_string(),
+        _ if lower.starts_with("/usb/") => {
+            let remainder = raw.get(5..).unwrap_or("").trim_start_matches('/');
+            if remainder.is_empty() {
+                "/usb/".to_string()
+            } else {
+                format!("/usb/{}", remainder)
+            }
+        }
+        _ if lower.starts_with("/local/") => {
+            let remainder = raw.get(7..).unwrap_or("").trim_start_matches('/');
+            if remainder.is_empty() {
+                "/local/".to_string()
+            } else {
+                format!("/local/{}", remainder)
+            }
+        }
+        _ if raw.starts_with('/') => raw,
+        _ => format!("/{}", raw),
+    }
+}
+
+async fn sdcp_toggle_feature(payload: &Value, cmd: u64, feature_label: &str, enabled: bool) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+
+    if mainboard_id.is_empty() {
+        return (
+            200,
+            json!({ "ok": false, "error": format!("Unable to resolve SDCP mainboard ID for {feature_label} command.") }),
+        );
+    }
+
+    let response = send_sdcp_command_and_await_response(
+        &parsed.0,
+        port,
+        &mainboard_id,
+        cmd,
+        json!({ "Enable": if enabled { 1 } else { 0 } }),
+        3200,
+    );
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let ack_description = match (cmd, ack) {
+        (386, 0) => "success",
+        (386, 1) => "exceeded maximum simultaneous streaming limit",
+        (386, 2) => "camera does not exist",
+        (386, 3) => "unknown error",
+        (387, 0) => "success",
+        (387, 1) => "unknown error",
+        (_, -1) => "no/invalid Ack in SDCP response",
+        _ => "unknown Ack",
+    };
+    let normalized_feature_label = if feature_label.trim().is_empty() {
+        "feature"
+    } else {
+        feature_label.trim()
+    };
+    let ack_label = if ack < 0 { "unknown".to_string() } else { ack.to_string() };
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "ack": ack,
+            "ackDescription": ack_description,
+            "message": if ack == 0 {
+                format!("SDCP command {normalized_feature_label} {} accepted.", if enabled { "enable" } else { "disable" })
+            } else {
+                format!("SDCP command {normalized_feature_label} {} rejected (Ack {}: {}).", if enabled { "enable" } else { "disable" }, ack_label, ack_description)
+            },
+            "error": if ack == 0 {
+                Value::Null
+            } else {
+                Value::String(format!("SDCP {normalized_feature_label} {} failed (Ack {}: {}).", if enabled { "enable" } else { "disable" }, ack_label, ack_description))
+            },
+            "rawResponse": response.unwrap_or(Value::Null),
+        }),
+    )
+}
+
 async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u16, Value) {
     let raw_host = resolve_raw_host(payload);
     let parsed = match parse_host_and_port(&raw_host) {
@@ -1667,6 +1786,10 @@ async fn handle_sdcp_network(operation: &str, payload: &Value) -> (u16, Value) {
         "discover" => sdcp_discover(payload).await,
         "printer/status" => sdcp_printer_status(payload).await,
         "printer/webcam/info" => sdcp_webcam_info(payload).await,
+        "printer/webcam/enable" => sdcp_toggle_feature(payload, 386, "video-stream", true).await,
+        "printer/webcam/disable" => sdcp_toggle_feature(payload, 386, "video-stream", false).await,
+        "printer/timelapse/enable" => sdcp_toggle_feature(payload, 387, "time-lapse", true).await,
+        "printer/timelapse/disable" => sdcp_toggle_feature(payload, 387, "time-lapse", false).await,
         "plates/list/json" => sdcp_plates_list(payload).await,
         "printer/start" => sdcp_control_operation(payload, 128, op).await,
         "printer/pause" => sdcp_control_operation(payload, 129, op).await,

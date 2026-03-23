@@ -1182,6 +1182,22 @@ async function handleSdcpWebcamInfo(payload: unknown): Promise<HandlerResult> {
 }
 
 async function handleSdcpWebcamDisable(payload: unknown): Promise<HandlerResult> {
+  return handleSdcpToggleFeature(payload, 386, 'webcam', false);
+}
+
+function normalizeSdcpStoragePath(value: unknown): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '/local/';
+
+  const lower = raw.toLowerCase();
+  if (lower === 'local' || lower === '/local') return '/local/';
+  if (lower === 'usb' || lower === '/usb') return '/usb/';
+  if (lower.startsWith('/usb/')) return `/usb/${raw.slice(5).replace(/^\/+/, '')}`;
+  if (lower.startsWith('/local/')) return `/local/${raw.slice(7).replace(/^\/+/, '')}`;
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+async function handleSdcpToggleFeature(payload: unknown, cmd: 386 | 387, featureLabel: string, enabled: boolean): Promise<HandlerResult> {
   const rawHost = typeof (payload as any)?.host === 'string'
     ? (payload as any).host
     : typeof (payload as any)?.ipAddress === 'string'
@@ -1189,20 +1205,58 @@ async function handleSdcpWebcamDisable(payload: unknown): Promise<HandlerResult>
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
-    return { status: 400, body: { ok: false, available: false, message: 'Invalid host or IP address' } };
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return { status: 200, body: { ok: false, error: `Unable to resolve SDCP mainboard ID for ${featureLabel} command.` } };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd,
+    data: { Enable: enabled ? 1 : 0 },
+    timeoutMs: 3200,
+  });
+  const ack = Number((response?.Data?.Data as any)?.Ack);
+  const ackDescription = cmd === 386
+    ? (ack === 0
+      ? 'success'
+      : ack === 1
+        ? 'exceeded maximum simultaneous streaming limit'
+        : ack === 2
+          ? 'camera does not exist'
+          : ack === 3
+            ? 'unknown error'
+            : Number.isFinite(ack)
+              ? 'unknown Ack'
+              : 'no/invalid Ack in SDCP response')
+    : (ack === 0
+      ? 'success'
+      : ack === 1
+        ? 'unknown error'
+        : Number.isFinite(ack)
+          ? 'unknown Ack'
+          : 'no/invalid Ack in SDCP response');
+  const ackLabel = Number.isFinite(ack) ? String(ack) : 'unknown';
 
   return {
     status: 200,
     body: {
-      ok: true,
-      available: false,
-      streamUrl: null,
-      snapshotUrl: null,
-      connectedStreams: null,
-      maximumStreams: null,
-      cameraStatus: null,
-      message: 'SDCP webcam disable is a no-op when using direct RTSP streaming.',
+      ok: ack === 0,
+      ack,
+      ackDescription,
+      message: ack === 0
+        ? `SDCP command ${featureLabel} ${enabled ? 'enable' : 'disable'} accepted.`
+        : `SDCP command ${featureLabel} ${enabled ? 'enable' : 'disable'} rejected (Ack ${ackLabel}: ${ackDescription}).`,
+      error: ack === 0 ? undefined : `SDCP ${featureLabel} ${enabled ? 'enable' : 'disable'} failed (Ack ${ackLabel}: ${ackDescription}).`,
+      rawResponse: response ?? null,
     },
   };
 }
@@ -1240,7 +1294,7 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
     port,
     mainboardId,
     cmd: 258,
-    data: { Url: '/local/' },
+    data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? (payload as any)?.source) },
     timeoutMs: 3200,
   });
   const payloadData = (response?.Data?.Data ?? {}) as Record<string, unknown>;
@@ -1370,6 +1424,9 @@ export async function handleSdcpV3NetworkOperation(operationPath: string[], payl
   if (op === 'printer/status') return handleSdcpPrinterStatus(payload);
   if (op === 'printer/webcam/info') return handleSdcpWebcamInfo(payload);
   if (op === 'printer/webcam/disable') return handleSdcpWebcamDisable(payload);
+  if (op === 'printer/webcam/enable') return handleSdcpToggleFeature(payload, 386, 'webcam', true);
+  if (op === 'printer/timelapse/enable') return handleSdcpToggleFeature(payload, 387, 'timelapse', true);
+  if (op === 'printer/timelapse/disable') return handleSdcpToggleFeature(payload, 387, 'timelapse', false);
   if (op === 'plates/list/json') return handleSdcpPlatesList(payload);
   if (op === 'printer/start') return handleSdcpControlOperation(payload, 128, op);
   if (op === 'printer/pause') return handleSdcpControlOperation(payload, 129, op);

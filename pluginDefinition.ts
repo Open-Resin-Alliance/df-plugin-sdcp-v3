@@ -41,6 +41,10 @@ const SDCP_MONITORING_ADAPTER: PluginMonitoringUiAdapterContract = {
   operations: {
     status: 'sdcp/printer/status',
     webcamInfo: 'sdcp/printer/webcam/info',
+    webcamEnable: 'sdcp/printer/webcam/enable',
+    webcamDisable: 'sdcp/printer/webcam/disable',
+    timelapseEnable: 'sdcp/printer/timelapse/enable',
+    timelapseDisable: 'sdcp/printer/timelapse/disable',
     platesList: 'sdcp/plates/list/json',
     start: 'sdcp/printer/start',
     deletePlate: 'sdcp/plate/delete',
