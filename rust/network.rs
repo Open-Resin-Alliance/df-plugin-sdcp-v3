@@ -19,7 +19,7 @@ static WEBCAM_STREAM_CACHE: OnceLock<Mutex<HashMap<String, WebcamStreamCacheEntr
 
 const DEFAULT_SDCP_PORT: u16 = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT: u16 = 3000;
-const SDCP_STATUS_PROBE_TIMEOUT_MS: u64 = 6_500;
+// const SDCP_STATUS_PROBE_TIMEOUT_MS: u64 = 6_500;
 const SDCP_STATUS_WS_TIMEOUT_MS: u64 = 6_500;
 
 struct WebcamStreamCacheEntry {
