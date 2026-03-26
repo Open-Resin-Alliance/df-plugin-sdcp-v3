@@ -358,6 +358,12 @@ function parseSdcpPositiveInteger(value: unknown): number | null {
   return Math.round(parsed);
 }
 
+function parseSdcpNonNegativeInteger(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.round(parsed);
+}
+
 function parseSdcpPlatePathAndName(entry: Record<string, unknown>): { fullPath: string; name: string } {
   const rawPath = selectSdcpFirstDefined(entry, ['name', 'Name', 'path', 'Path', 'file', 'File', 'Filename', 'filename']);
   const fullPathRaw = typeof rawPath === 'string' ? rawPath.trim() : '';
@@ -417,23 +423,30 @@ function parseSdcpPlateRecord(entry: Record<string, unknown>): Record<string, un
 function parseSdcpTaskDetailsFromResponse(frame: SdcpWsFrame | null): Array<Record<string, unknown>> {
   const data = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
   const directTaskDetails = collectSdcpRecordArraysByKeys(data, [
-    'TaskDetailList', 'taskDetailList', 'TaskList', 'taskList', 'HistoryList', 'historyList', 'Data', 'data',
+    'TaskDetailList', 'taskDetailList', 'HistoryDetailList', 'historyDetailList', 'TaskList', 'taskList', 'HistoryList', 'historyList', 'Data', 'data',
   ]);
 
   if (directTaskDetails.length > 0) return directTaskDetails;
 
-  return parseSdcpUnknownRecordArray(data.TaskDetailList ?? data.taskDetailList);
+  return parseSdcpUnknownRecordArray(
+    data.TaskDetailList
+    ?? data.taskDetailList
+    ?? data.HistoryDetailList
+    ?? data.historyDetailList,
+  );
 }
 
 function parseSdcpTaskIdsFromResponse(frame: SdcpWsFrame | null): string[] {
   const data = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
   const arrays = [
+    ...(Array.isArray(data.HistoryData) ? [data.HistoryData] : []),
+    ...(Array.isArray(data.historyData) ? [data.historyData] : []),
     ...(Array.isArray(data.TaskIdList) ? [data.TaskIdList] : []),
     ...(Array.isArray(data.taskIdList) ? [data.taskIdList] : []),
     ...(Array.isArray(data.HistoryTaskIdList) ? [data.HistoryTaskIdList] : []),
     ...(Array.isArray(data.historyTaskIdList) ? [data.historyTaskIdList] : []),
     ...(Array.isArray(data.TaskList) ? [data.TaskList] : []),
-    ...collectSdcpRecordArraysByKeys(data, ['TaskIdList', 'taskIdList', 'HistoryTaskIdList', 'historyTaskIdList']),
+    ...collectSdcpRecordArraysByKeys(data, ['HistoryData', 'historyData', 'TaskIdList', 'taskIdList', 'HistoryTaskIdList', 'historyTaskIdList']),
   ];
 
   const ids = new Set<string>();
@@ -508,6 +521,53 @@ function mergeSdcpTaskDetailIntoPlate(
     ...(profileId != null ? { ProfileID: profileId, profileId } : {}),
     file_data: mergedFileData,
   };
+}
+
+function extractSdcpStringFromRecord(record: Record<string, unknown>, keys: string[]): string | null {
+  const raw = selectSdcpFirstDefined(record, keys);
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isSdcpTaskStatusActive(taskStatus: number | null): boolean {
+  if (taskStatus == null) return false;
+  // SDCP v3 Cmd 321: 1=Completed, 2=Exceptional, 3=Stopped. Other values are active/non-terminal.
+  return taskStatus !== 1 && taskStatus !== 2 && taskStatus !== 3;
+}
+
+function resolveSdcpActiveTaskDetail(args: {
+  taskDetails: Array<Record<string, unknown>>;
+  taskId: string | null;
+  jobName: string | null;
+}): Record<string, unknown> | null {
+  const { taskDetails, taskId, jobName } = args;
+  if (taskDetails.length === 0) return null;
+
+  if (taskId) {
+    const matchedByTaskId = taskDetails.find((detail) => {
+      const detailTaskId = extractSdcpStringFromRecord(detail, ['TaskId', 'taskId', 'Id', 'id']);
+      return detailTaskId?.toLowerCase() === taskId.toLowerCase();
+    });
+    if (matchedByTaskId) return matchedByTaskId;
+  }
+
+  const normalizedJobName = normalizeSdcpComparablePath(jobName);
+  if (normalizedJobName) {
+    const matchedByFilename = taskDetails.find((detail) => {
+      const detailPath = extractSdcpStringFromRecord(detail, ['Filename', 'filename', 'FileName', 'fileName', 'Path', 'path', 'File', 'file']);
+      const detailTaskName = extractSdcpStringFromRecord(detail, ['TaskName', 'taskName', 'Name', 'name']);
+      const comparablePath = normalizeSdcpComparablePath(detailPath);
+      const comparableTail = getSdcpPathTail(detailPath);
+      const comparableTaskName = normalizeSdcpComparablePath(detailTaskName);
+      return comparablePath.includes(normalizedJobName)
+        || comparableTail === normalizedJobName
+        || comparableTaskName.includes(normalizedJobName);
+    });
+    if (matchedByFilename) return matchedByFilename;
+  }
+
+  return taskDetails[0] ?? null;
 }
 
 function parseSdcpWsFrame(data: string): SdcpWsFrame | null {
@@ -927,6 +987,12 @@ function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
 } {
   const status = (frame?.Data as any)?.Status as Record<string, unknown> | undefined;
   const printInfo = (status?.PrintInfo as Record<string, unknown> | undefined) ?? {};
+  const currentMachineStatusRaw = status?.CurrentStatus;
+  const currentMachineStatuses = Array.isArray(currentMachineStatusRaw)
+    ? currentMachineStatusRaw.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+    : [Number(currentMachineStatusRaw)].filter((value) => Number.isFinite(value));
+  const machineStatusPrinting = currentMachineStatuses.includes(1);
+  const machineStatusProcessing = currentMachineStatuses.some((value) => value === 2 || value === 3 || value === 4);
 
   const printStatus = Number(printInfo.Status);
   const currentLayer = Number.isFinite(Number(printInfo.CurrentLayer)) ? Number(printInfo.CurrentLayer) : null;
@@ -973,12 +1039,24 @@ function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
   };
 
   const mapped = Number.isFinite(printStatus) ? statusMap[printStatus] : undefined;
+  const isPaused = mapped?.paused ?? false;
+  const isPrinting = isPaused ? true : ((mapped?.printing ?? false) || machineStatusPrinting);
+  const state = isPaused
+    ? 'paused'
+    : isPrinting
+      ? 'printing'
+      : (mapped?.state || (machineStatusProcessing ? 'processing' : 'online'));
+  const stateText = isPaused
+    ? 'Paused'
+    : isPrinting
+      ? 'Printing'
+      : (mapped?.text || (machineStatusProcessing ? 'Processing' : 'Online'));
 
   return {
-    stateText: mapped?.text || 'Online',
-    state: mapped?.state || 'online',
-    isPrinting: mapped?.printing ?? false,
-    isPaused: mapped?.paused ?? false,
+    stateText,
+    state,
+    isPrinting,
+    isPaused,
     progressPct: progressFromLayer ?? progressFromTime,
     currentLayer,
     totalLayers,
@@ -1367,6 +1445,78 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
     : { statusFrame: null, attributesFrame: null };
   const printInfo = extractPrintInfoFromStatusFrame(telemetry.statusFrame);
 
+  let taskDetailAck: number | null = null;
+  let activeTaskDetail: Record<string, unknown> | null = null;
+
+  if (mainboardId) {
+    const explicitTaskIds = printInfo.taskId ? [printInfo.taskId] : [];
+    const taskIds = explicitTaskIds.length > 0
+      ? explicitTaskIds
+      : parseSdcpTaskIdsFromResponse(await sendSdcpCommandAndAwaitResponse({
+        host: parsedHost.host,
+        port,
+        mainboardId,
+        cmd: 320,
+        data: {},
+        timeoutMs: 3200,
+      })).slice(0, 20);
+
+    if (taskIds.length > 0) {
+      const detailResponse = await sendSdcpCommandAndAwaitResponse({
+        host: parsedHost.host,
+        port,
+        mainboardId,
+        cmd: 321,
+        data: { TaskIdList: taskIds, Id: taskIds },
+        timeoutMs: 4200,
+      });
+      taskDetailAck = extractSdcpAck(detailResponse);
+      const taskDetails = parseSdcpTaskDetailsFromResponse(detailResponse);
+      activeTaskDetail = resolveSdcpActiveTaskDetail({
+        taskDetails,
+        taskId: printInfo.taskId,
+        jobName: printInfo.jobName,
+      });
+    }
+  }
+
+  const activeTaskStatus = activeTaskDetail
+    ? parseSdcpNonNegativeInteger(selectSdcpFirstDefined(activeTaskDetail, ['TaskStatus', 'taskStatus', 'Status', 'status']))
+    : null;
+  const activeTaskRunning = isSdcpTaskStatusActive(activeTaskStatus);
+  const activeTaskThumbnailPath = activeTaskDetail
+    ? extractSdcpStringFromRecord(activeTaskDetail, ['Thumbnail', 'thumbnail', 'ThumbnailUrl', 'thumbnailUrl', 'ThumbnailPath', 'thumbnailPath'])
+    : null;
+  const activeTaskId = activeTaskDetail
+    ? extractSdcpStringFromRecord(activeTaskDetail, ['TaskId', 'taskId', 'Id', 'id'])
+    : null;
+  const activeTaskPath = activeTaskDetail
+    ? extractSdcpStringFromRecord(activeTaskDetail, ['Filename', 'filename', 'FileName', 'fileName', 'Path', 'path', 'File', 'file'])
+    : null;
+  const activeTaskName = activeTaskDetail
+    ? extractSdcpStringFromRecord(activeTaskDetail, ['TaskName', 'taskName', 'Name', 'name'])
+    : null;
+
+  const resolvedIsPrinting = printInfo.isPrinting || activeTaskRunning;
+  const resolvedState = printInfo.isPaused
+    ? 'paused'
+    : resolvedIsPrinting
+      ? 'printing'
+      : printInfo.state;
+  const resolvedStateText = printInfo.isPaused
+    ? 'Paused'
+    : resolvedIsPrinting
+      ? 'Printing'
+      : printInfo.stateText;
+  const resolvedJobName = printInfo.jobName
+    ?? activeTaskName
+    ?? (activeTaskPath ? derivePlateNameFromPath(activeTaskPath) : null);
+  const resolvedPlateKey = activeTaskPath
+    ?? activeTaskId
+    ?? printInfo.taskId
+    ?? resolvedJobName
+    ?? '';
+
   const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probed, 1400);
 
   const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
@@ -1387,17 +1537,21 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       port: enriched.port,
       mainboardId,
       firmwareVersion: firmwareVersionFromAttrs || enriched.firmwareVersion,
-      stateText: printInfo.stateText || enriched.statusText || 'Online',
+      stateText: resolvedStateText || enriched.statusText || 'Online',
       statusText: enriched.statusText,
-      state: printInfo.state || enriched.state || 'online',
-      isPrinting: printInfo.isPrinting,
+      state: resolvedState || enriched.state || 'online',
+      isPrinting: resolvedIsPrinting,
       isPaused: printInfo.isPaused,
       progressPct: printInfo.progressPct,
       currentLayer: printInfo.currentLayer,
       totalLayers: printInfo.totalLayers,
-      plateId: printInfo.taskId ? hashPlateIdFromPath(printInfo.taskId) : null,
-      jobName: printInfo.jobName,
+      plateId: resolvedPlateKey ? hashPlateIdFromPath(resolvedPlateKey) : null,
+      jobName: resolvedJobName,
       etaSec: printInfo.etaSec,
+      taskId: activeTaskId ?? printInfo.taskId,
+      taskStatus: activeTaskStatus,
+      thumbnailPath: activeTaskThumbnailPath,
+      taskDetailOk: taskDetailAck === null ? null : taskDetailAck === 0,
     },
   };
 }
@@ -1569,7 +1723,7 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
       port,
       mainboardId,
       cmd: 321,
-      data: { TaskIdList: historyTaskIds },
+      data: { TaskIdList: historyTaskIds, Id: historyTaskIds },
       timeoutMs: 4200,
     })
     : null;
@@ -1818,7 +1972,7 @@ async function handleSdcpTaskDetails(payload: unknown): Promise<HandlerResult> {
     port,
     mainboardId,
     cmd: 321,
-    data: { TaskIdList: taskIds },
+    data: { TaskIdList: taskIds, Id: taskIds },
     timeoutMs: 4200,
   });
   const ack = extractSdcpAck(response);

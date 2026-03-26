@@ -594,6 +594,154 @@ fn find_sdcp_plate_path_from_file_list(files: &[Value], plate_id: Option<i64>, n
     None
 }
 
+fn extract_sdcp_string_field(record: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = record.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_sdcp_i64_field(record: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        if let Some(value) = record.get(*key) {
+            if let Some(parsed) = value.as_i64() {
+                return Some(parsed);
+            }
+            if let Some(parsed) = value.as_u64() {
+                return i64::try_from(parsed).ok();
+            }
+            if let Some(parsed) = value.as_f64() {
+                if parsed.is_finite() {
+                    return Some(parsed.round() as i64);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_sdcp_task_ids_from_response(frame: &Value) -> Vec<String> {
+    let data = frame.pointer("/Data/Data").unwrap_or(&Value::Null);
+    let mut ids = Vec::<String>::new();
+
+    let candidate_arrays = [
+        "HistoryData",
+        "historyData",
+        "TaskIdList",
+        "taskIdList",
+        "HistoryTaskIdList",
+        "historyTaskIdList",
+        "TaskList",
+    ];
+
+    for key in candidate_arrays {
+        if let Some(values) = data.get(key).and_then(|v| v.as_array()) {
+            for value in values {
+                if let Some(text) = value.as_str() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        ids.push(trimmed.to_string());
+                        continue;
+                    }
+                }
+
+                if let Some(obj) = value.as_object() {
+                    for candidate_key in ["TaskId", "taskId", "ID", "id"] {
+                        if let Some(text) = obj.get(candidate_key).and_then(|v| v.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                ids.push(trimmed.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::<String>::new();
+    ids.into_iter().filter(|id| seen.insert(id.to_lowercase())).collect()
+}
+
+fn parse_sdcp_task_details_from_response(frame: &Value) -> Vec<Value> {
+    let data = frame.pointer("/Data/Data").unwrap_or(&Value::Null);
+
+    for key in [
+        "HistoryDetailList",
+        "historyDetailList",
+        "TaskDetailList",
+        "taskDetailList",
+        "TaskList",
+        "taskList",
+        "HistoryList",
+        "historyList",
+    ] {
+        if let Some(values) = data.get(key).and_then(|v| v.as_array()) {
+            return values
+                .iter()
+                .filter(|item| item.is_object())
+                .cloned()
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+fn is_sdcp_task_status_active(task_status: Option<i64>) -> bool {
+    match task_status {
+        Some(status) => status != 1 && status != 2 && status != 3,
+        None => false,
+    }
+}
+
+fn resolve_sdcp_active_task_detail(task_details: &[Value], task_id: Option<&str>, job_name: Option<&str>) -> Option<Value> {
+    if task_details.is_empty() {
+        return None;
+    }
+
+    let normalized_task_id = task_id
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+    if let Some(target_task_id) = normalized_task_id {
+        if let Some(found) = task_details.iter().find(|detail| {
+            extract_sdcp_string_field(detail, &["TaskId", "taskId", "Id", "id"])
+                .map(|value| value.to_lowercase() == target_task_id)
+                .unwrap_or(false)
+        }) {
+            return Some(found.clone());
+        }
+    }
+
+    let normalized_job_name = job_name
+        .map(normalize_sdcp_comparable_path)
+        .filter(|value| !value.is_empty());
+    if let Some(target_job_name) = normalized_job_name {
+        if let Some(found) = task_details.iter().find(|detail| {
+            let detail_path = extract_sdcp_string_field(detail, &["Filename", "filename", "FileName", "fileName", "Path", "path", "File", "file"])
+                .unwrap_or_default();
+            let detail_task_name = extract_sdcp_string_field(detail, &["TaskName", "taskName", "Name", "name"])
+                .unwrap_or_default();
+            let comparable_path = normalize_sdcp_comparable_path(&detail_path);
+            let comparable_tail = sdcp_path_tail(&detail_path);
+            let comparable_task_name = normalize_sdcp_comparable_path(&detail_task_name);
+            comparable_path.contains(&target_job_name)
+                || comparable_tail == target_job_name
+                || comparable_task_name.contains(&target_job_name)
+        }) {
+            return Some(found.clone());
+        }
+    }
+
+    task_details.first().cloned()
+}
+
     fn resolve_sdcp_device_via_udp_discovery(host: &str, timeout_ms: u64) -> Option<Value> {
         let normalized_host = host.trim().to_lowercase();
         if normalized_host.is_empty() {
@@ -1055,10 +1203,32 @@ fn request_sdcp_status_and_attributes(
 }
 
 fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
+    let status_obj = status_frame
+        .and_then(|f| f.pointer("/Data/Status"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let print_info = status_frame
         .and_then(|f| f.pointer("/Data/Status/PrintInfo"))
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    let current_machine_statuses: Vec<i64> = if let Some(values) = status_obj.get("CurrentStatus").and_then(|v| v.as_array()) {
+        values
+            .iter()
+            .filter_map(|value| value.as_i64().or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok())))
+            .collect()
+    } else {
+        status_obj
+            .get("CurrentStatus")
+            .and_then(|value| value.as_i64().or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok())))
+            .map(|value| vec![value])
+            .unwrap_or_default()
+    };
+
+    let machine_status_printing = current_machine_statuses.iter().any(|status| *status == 1);
+    let machine_status_processing = current_machine_statuses
+        .iter()
+        .any(|status| *status == 2 || *status == 3 || *status == 4);
 
     let print_status = print_info.get("Status").and_then(|v| v.as_i64()).unwrap_or(-1);
     let current_layer = print_info.get("CurrentLayer").and_then(|v| v.as_i64());
@@ -1093,7 +1263,7 @@ fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
         _ => None,
     };
 
-    let (state_text, state, is_printing, is_paused) = match print_status {
+    let (base_state_text, base_state, base_is_printing, base_is_paused) = match print_status {
         0 => ("Idle", "idle", false, false),
         1..=5 => ("Printing", "printing", true, false),
         6 => ("Paused", "paused", true, true),
@@ -1101,6 +1271,31 @@ fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
         8 | 9 => ("Idle", "idle", false, false),
         10 => ("Processing", "processing", false, false),
         _ => ("Online", "online", false, false),
+    };
+
+    let is_paused = base_is_paused;
+    let is_printing = if is_paused {
+        true
+    } else {
+        base_is_printing || machine_status_printing
+    };
+    let state = if is_paused {
+        "paused"
+    } else if is_printing {
+        "printing"
+    } else if base_state == "online" && machine_status_processing {
+        "processing"
+    } else {
+        base_state
+    };
+    let state_text = if is_paused {
+        "Paused"
+    } else if is_printing {
+        "Printing"
+    } else if base_state_text == "Online" && machine_status_processing {
+        "Processing"
+    } else {
+        base_state_text
     };
 
     json!({
@@ -1435,6 +1630,141 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     };
 
     let print_info = extract_print_info_from_status_frame(status_frame.as_ref());
+    let mut task_detail_ack: Option<i64> = None;
+    let mut active_task_detail: Option<Value> = None;
+
+    if !mainboard_id.is_empty() {
+        let explicit_task_id = print_info
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let task_ids = if let Some(task_id) = explicit_task_id.clone() {
+            vec![task_id]
+        } else {
+            let history_response = send_sdcp_command_and_await_response(
+                &parsed.0,
+                port,
+                &mainboard_id,
+                320,
+                json!({}),
+                3200,
+            );
+            history_response
+                .as_ref()
+                .map(parse_sdcp_task_ids_from_response)
+                .unwrap_or_default()
+                .into_iter()
+                .take(20)
+                .collect::<Vec<_>>()
+        };
+
+        if !task_ids.is_empty() {
+            let detail_response = send_sdcp_command_and_await_response(
+                &parsed.0,
+                port,
+                &mainboard_id,
+                321,
+                json!({
+                    "TaskIdList": task_ids,
+                    "Id": task_ids,
+                }),
+                4200,
+            );
+
+            task_detail_ack = detail_response
+                .as_ref()
+                .and_then(|f| f.pointer("/Data/Data/Ack"))
+                .and_then(|v| v.as_i64());
+
+            let task_details = detail_response
+                .as_ref()
+                .map(parse_sdcp_task_details_from_response)
+                .unwrap_or_default();
+
+            let print_task_id = print_info.get("taskId").and_then(|v| v.as_str());
+            let print_job_name = print_info.get("jobName").and_then(|v| v.as_str());
+            active_task_detail = resolve_sdcp_active_task_detail(&task_details, print_task_id, print_job_name);
+        }
+    }
+
+    let active_task_status = active_task_detail
+        .as_ref()
+        .and_then(|detail| extract_sdcp_i64_field(detail, &["TaskStatus", "taskStatus", "Status", "status"]));
+    let active_task_running = is_sdcp_task_status_active(active_task_status);
+    let active_task_thumbnail = active_task_detail
+        .as_ref()
+        .and_then(|detail| extract_sdcp_string_field(detail, &["Thumbnail", "thumbnail", "ThumbnailUrl", "thumbnailUrl", "ThumbnailPath", "thumbnailPath"]));
+    let active_task_id = active_task_detail
+        .as_ref()
+        .and_then(|detail| extract_sdcp_string_field(detail, &["TaskId", "taskId", "Id", "id"]));
+    let active_task_path = active_task_detail
+        .as_ref()
+        .and_then(|detail| extract_sdcp_string_field(detail, &["Filename", "filename", "FileName", "fileName", "Path", "path", "File", "file"]));
+    let active_task_name = active_task_detail
+        .as_ref()
+        .and_then(|detail| extract_sdcp_string_field(detail, &["TaskName", "taskName", "Name", "name"]));
+
+    let print_info_is_printing = print_info
+        .get("isPrinting")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let print_info_is_paused = print_info
+        .get("isPaused")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let resolved_is_printing = print_info_is_printing || active_task_running;
+    let resolved_state = if print_info_is_paused {
+        "paused".to_string()
+    } else if resolved_is_printing {
+        "printing".to_string()
+    } else {
+        print_info
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("online")
+            .to_string()
+    };
+    let resolved_state_text = if print_info_is_paused {
+        "Paused".to_string()
+    } else if resolved_is_printing {
+        "Printing".to_string()
+    } else {
+        print_info
+            .get("stateText")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Online")
+            .to_string()
+    };
+    let resolved_job_name = print_info
+        .get("jobName")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or(active_task_name)
+        .or_else(|| {
+            active_task_path.as_ref().map(|path| {
+                path
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .unwrap_or(path.as_str())
+                    .to_string()
+            })
+        });
+    let resolved_plate_key = active_task_path
+        .clone()
+        .or(active_task_id.clone())
+        .or_else(|| {
+            print_info
+                .get("taskId")
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| resolved_job_name.clone());
+
     let firmware_from_attrs = attributes_frame
         .as_ref()
         .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
@@ -1442,10 +1772,6 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
         .unwrap_or("")
         .trim()
         .to_string();
-
-    let state_text = print_info.get("stateText").cloned().unwrap_or_else(|| {
-        device.get("statusText").cloned().unwrap_or(Value::String("Online".to_string()))
-    });
 
     (
         200,
@@ -1464,21 +1790,33 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
             } else {
                 Value::String(firmware_from_attrs)
             },
-            "stateText": state_text,
+            "stateText": resolved_state_text,
             "statusText": device.get("statusText").cloned().unwrap_or(Value::String("Online".to_string())),
-            "state": print_info.get("state").cloned().unwrap_or_else(|| device.get("state").cloned().unwrap_or(Value::String("online".to_string()))),
-            "isPrinting": print_info.get("isPrinting").cloned().unwrap_or(Value::Bool(false)),
-            "isPaused": print_info.get("isPaused").cloned().unwrap_or(Value::Bool(false)),
+            "state": resolved_state,
+            "isPrinting": resolved_is_printing,
+            "isPaused": print_info_is_paused,
             "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
             "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
             "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
-            "plateId": print_info
-                .get("taskId")
-                .and_then(|v| v.as_str())
+            "plateId": resolved_plate_key
+                .as_ref()
                 .map(|v| Value::from(hash_plate_id_from_path(v)))
                 .unwrap_or(Value::Null),
-            "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
+            "jobName": resolved_job_name.map(Value::String).unwrap_or(Value::Null),
             "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
+            "taskId": active_task_id
+                .or_else(|| {
+                    print_info
+                        .get("taskId")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                })
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "taskStatus": active_task_status.map(Value::from).unwrap_or(Value::Null),
+            "thumbnailPath": active_task_thumbnail.map(Value::String).unwrap_or(Value::Null),
+            "taskDetailOk": task_detail_ack.map(|ack| ack == 0).map(Value::Bool).unwrap_or(Value::Null),
         }),
     )
 }
@@ -2049,6 +2387,156 @@ async fn sdcp_plate_delete(payload: &Value) -> (u16, Value) {
     )
 }
 
+async fn sdcp_task_history_list(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+    if mainboard_id.is_empty() {
+        return (200, json!({ "ok": false, "error": "Unable to resolve SDCP mainboard ID for task history command." }));
+    }
+
+    let response = send_sdcp_command_and_await_response(
+        &parsed.0,
+        port,
+        &mainboard_id,
+        320,
+        json!({}),
+        3200,
+    );
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let task_ids = response
+        .as_ref()
+        .map(parse_sdcp_task_ids_from_response)
+        .unwrap_or_default();
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "ack": ack,
+            "taskIds": task_ids,
+            "error": if ack == 0 { Value::Null } else { Value::String("SDCP task history request failed.".to_string()) },
+            "rawResponse": response.unwrap_or(Value::Null),
+        }),
+    )
+}
+
+async fn sdcp_task_details(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+    if mainboard_id.is_empty() {
+        return (200, json!({ "ok": false, "error": "Unable to resolve SDCP mainboard ID for task details command." }));
+    }
+
+    let mut task_ids: Vec<String> = payload
+        .get("taskIds")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if task_ids.is_empty() {
+        let history_response = send_sdcp_command_and_await_response(
+            &parsed.0,
+            port,
+            &mainboard_id,
+            320,
+            json!({}),
+            3200,
+        );
+        task_ids = history_response
+            .as_ref()
+            .map(parse_sdcp_task_ids_from_response)
+            .unwrap_or_default();
+    }
+
+    if task_ids.is_empty() {
+        return (
+            200,
+            json!({
+                "ok": true,
+                "ack": 0,
+                "taskIds": [],
+                "taskDetails": [],
+            }),
+        );
+    }
+
+    task_ids.truncate(60);
+    let response = send_sdcp_command_and_await_response(
+        &parsed.0,
+        port,
+        &mainboard_id,
+        321,
+        json!({
+            "TaskIdList": task_ids,
+            "Id": task_ids,
+        }),
+        4200,
+    );
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let task_details = response
+        .as_ref()
+        .map(parse_sdcp_task_details_from_response)
+        .unwrap_or_default();
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "ack": ack,
+            "taskIds": task_ids,
+            "taskDetails": task_details,
+            "error": if ack == 0 { Value::Null } else { Value::String("SDCP task detail request failed.".to_string()) },
+            "rawResponse": response.unwrap_or(Value::Null),
+        }),
+    )
+}
+
 fn unsupported_operation_response(operation: &str) -> (u16, Value) {
     (
         404,
@@ -2083,6 +2571,8 @@ async fn handle_sdcp_network(operation: &str, payload: &Value) -> (u16, Value) {
         "printer/unpause" => sdcp_control_operation(payload, 131, op).await,
         "upload/chunk" => sdcp_upload_chunk(payload).await,
         "plate/delete" => sdcp_plate_delete(payload).await,
+        "task/history/list" => sdcp_task_history_list(payload).await,
+        "task/details" => sdcp_task_details(payload).await,
         "materials" | "materials/edit" | "unsupported" => unsupported_operation_response(op),
         _ => (
             404,

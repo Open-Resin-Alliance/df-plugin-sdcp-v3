@@ -14,6 +14,9 @@ export type SdcpMonitoringSnapshot = {
   plateId: number | null;
   jobName: string | null;
   etaSec: number | null;
+  thumbnailPath?: string | null;
+  taskId?: string | null;
+  taskStatus?: number | null;
 };
 
 export type SdcpWebcamFeedInfo = {
@@ -115,6 +118,15 @@ export function resolveSdcpMonitoringSnapshot(payload: unknown): SdcpMonitoringS
   const totalLayers = toFiniteNumber(root.totalLayers ?? root.layers);
   const plateId = toFiniteNumber(root.plateId ?? root.plate_id);
   const etaSec = toFiniteNumber(root.etaSec ?? root.eta ?? root.remainingSec);
+  const thumbnailPathRaw = root.thumbnailPath ?? root.thumbnail ?? root.thumbnailUrl;
+  const thumbnailPath = typeof thumbnailPathRaw === 'string' && thumbnailPathRaw.trim().length > 0
+    ? thumbnailPathRaw.trim()
+    : null;
+  const taskIdRaw = root.taskId ?? root.TaskId;
+  const taskId = typeof taskIdRaw === 'string' && taskIdRaw.trim().length > 0
+    ? taskIdRaw.trim()
+    : null;
+  const taskStatus = toFiniteNumber(root.taskStatus ?? root.TaskStatus ?? root.statusCode);
 
   const jobNameRaw = root.jobName ?? root.path ?? root.fileName ?? root.name;
   const jobName = typeof jobNameRaw === 'string' && jobNameRaw.trim().length > 0
@@ -135,6 +147,9 @@ export function resolveSdcpMonitoringSnapshot(payload: unknown): SdcpMonitoringS
     plateId: plateId != null && plateId > 0 ? Math.round(plateId) : null,
     jobName,
     etaSec: etaSec != null && etaSec >= 0 ? etaSec : null,
+    thumbnailPath,
+    taskId,
+    taskStatus,
   };
 }
 
