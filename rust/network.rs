@@ -521,6 +521,79 @@ fn hash_plate_id_from_path(path: &str) -> i64 {
     if normalized <= 0 { 1 } else { normalized }
 }
 
+fn normalize_sdcp_comparable_path(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase()
+}
+
+fn sdcp_path_tail(value: &str) -> String {
+    let normalized = normalize_sdcp_comparable_path(value);
+    normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn resolve_sdcp_file_list(frame: &Value) -> Vec<Value> {
+    frame
+        .pointer("/Data/Data/FileList")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn find_sdcp_plate_path_from_file_list(files: &[Value], plate_id: Option<i64>, name_hint: &str) -> Option<String> {
+    let normalized_hint = normalize_sdcp_comparable_path(name_hint);
+
+    for file in files {
+        let file_type = file
+            .get("type")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)))
+            .unwrap_or(1);
+        if file_type != 1 {
+            continue;
+        }
+
+        let full_path = file
+            .get("name")
+            .or_else(|| file.get("Name"))
+            .or_else(|| file.get("path"))
+            .or_else(|| file.get("Path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if full_path.is_empty() {
+            continue;
+        }
+
+        if let Some(target_id) = plate_id {
+            let derived = hash_plate_id_from_path(&full_path);
+            if derived == target_id {
+                return Some(full_path);
+            }
+        }
+
+        if !normalized_hint.is_empty() {
+            let normalized_path = normalize_sdcp_comparable_path(&full_path);
+            let normalized_tail = sdcp_path_tail(&full_path);
+            if normalized_path.contains(&normalized_hint) || normalized_tail == normalized_hint {
+                return Some(full_path);
+            }
+        }
+    }
+
+    None
+}
+
     fn resolve_sdcp_device_via_udp_discovery(host: &str, timeout_ms: u64) -> Option<Value> {
         let normalized_host = host.trim().to_lowercase();
         if normalized_host.is_empty() {
@@ -1778,13 +1851,52 @@ async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u
             .unwrap_or("")
             .trim()
             .to_string();
+        let path = payload
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let resolved_filename = if !filename.is_empty() {
             filename
+        } else if !path.is_empty() {
+            path
         } else if !job_name.is_empty() {
             let base = job_name.rsplit_once('.').map(|(b, _)| b).unwrap_or(job_name.as_str());
             format!("{base}.ctb")
         } else {
-            String::new()
+            let requested_plate_id = payload
+                .get("plateId")
+                .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)));
+            let plate_name_hint = payload
+                .get("plateName")
+                .or_else(|| payload.get("jobName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            let storage_path = normalize_sdcp_storage_path(
+                payload
+                    .get("storagePath")
+                    .or_else(|| payload.get("source"))
+                    .or_else(|| payload.get("url")),
+            );
+
+            let list_response = send_sdcp_command_and_await_response(
+                &parsed.0,
+                port,
+                &mainboard_id,
+                258,
+                json!({ "Url": storage_path }),
+                3200,
+            );
+
+            list_response
+                .as_ref()
+                .map(resolve_sdcp_file_list)
+                .and_then(|files| find_sdcp_plate_path_from_file_list(&files, requested_plate_id, &plate_name_hint))
+                .unwrap_or_default()
         };
 
         if resolved_filename.is_empty() {
@@ -1792,7 +1904,7 @@ async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u
                 400,
                 json!({
                     "ok": false,
-                    "error": "Start printing requires filename or jobName for SDCP Cmd 128.",
+                    "error": "Start printing requires filename/path/jobName, or a resolvable plateId for SDCP Cmd 128.",
                 }),
             );
         }
@@ -1825,6 +1937,118 @@ async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u
     )
 }
 
+async fn sdcp_plate_delete(payload: &Value) -> (u16, Value) {
+    let raw_host = resolve_raw_host(payload);
+    let parsed = match parse_host_and_port(&raw_host) {
+        Some(parsed) => parsed,
+        None => return (400, json!({ "ok": false, "error": "Invalid host or IP address" })),
+    };
+    let port = resolve_port(payload.get("port"), parsed.1);
+
+    let payload_mainboard = payload
+        .get("mainboardId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
+        payload_mainboard
+    } else {
+        resolve_mainboard_id_for_host(&parsed.0, port).await
+    };
+    if mainboard_id.is_empty() {
+        return (200, json!({ "ok": false, "error": "Unable to resolve SDCP mainboard ID for delete command." }));
+    }
+
+    let direct_path = payload
+        .get("path")
+        .or_else(|| payload.get("filename"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let requested_plate_id = payload
+        .get("plateId")
+        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)));
+    let name_hint = payload
+        .get("jobName")
+        .or_else(|| payload.get("plateName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let resolved_path = if !direct_path.is_empty() {
+        direct_path
+    } else {
+        let storage_path = normalize_sdcp_storage_path(
+            payload
+                .get("storagePath")
+                .or_else(|| payload.get("source"))
+                .or_else(|| payload.get("url")),
+        );
+
+        let list_response = send_sdcp_command_and_await_response(
+            &parsed.0,
+            port,
+            &mainboard_id,
+            258,
+            json!({ "Url": storage_path }),
+            3200,
+        );
+
+        list_response
+            .as_ref()
+            .map(resolve_sdcp_file_list)
+            .and_then(|files| find_sdcp_plate_path_from_file_list(&files, requested_plate_id, &name_hint))
+            .unwrap_or_default()
+    };
+
+    if resolved_path.is_empty() {
+        return (
+            400,
+            json!({
+                "ok": false,
+                "error": "Unable to resolve SDCP file path for delete command. Provide path or filename.",
+            }),
+        );
+    }
+
+    let response = send_sdcp_command_and_await_response(
+        &parsed.0,
+        port,
+        &mainboard_id,
+        259,
+        json!({
+            "FileList": [resolved_path.clone()],
+            "FolderList": [],
+        }),
+        3200,
+    );
+
+    let ack = response
+        .as_ref()
+        .and_then(|f| f.pointer("/Data/Data/Ack"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+
+    (
+        200,
+        json!({
+            "ok": ack == 0,
+            "ack": ack,
+            "path": resolved_path,
+            "message": if ack == 0 {
+                format!("Deleted SDCP plate file {}.", resolved_path)
+            } else {
+                format!("SDCP plate delete rejected (Ack {}).", if ack < 0 { "unknown".to_string() } else { ack.to_string() })
+            },
+            "error": if ack == 0 { Value::Null } else { Value::String("SDCP plate delete failed.".to_string()) },
+        }),
+    )
+}
+
 fn unsupported_operation_response(operation: &str) -> (u16, Value) {
     (
         404,
@@ -1853,10 +2077,12 @@ async fn handle_sdcp_network(operation: &str, payload: &Value) -> (u16, Value) {
         "plates/list/json" => sdcp_plates_list(payload).await,
         "printer/start" => sdcp_control_operation(payload, 128, op).await,
         "printer/pause" => sdcp_control_operation(payload, 129, op).await,
+        "printer/cancel" => sdcp_control_operation(payload, 130, op).await,
         "printer/stop" | "printer/force-stop" => sdcp_control_operation(payload, 130, op).await,
+        "printer/resume" => sdcp_control_operation(payload, 131, op).await,
         "printer/unpause" => sdcp_control_operation(payload, 131, op).await,
         "upload/chunk" => sdcp_upload_chunk(payload).await,
-        "plate/delete" => unsupported_operation_response(op),
+        "plate/delete" => sdcp_plate_delete(payload).await,
         "materials" | "materials/edit" | "unsupported" => unsupported_operation_response(op),
         _ => (
             404,

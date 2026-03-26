@@ -257,6 +257,259 @@ function hashPlateIdFromPath(path: string): number {
   return Math.max(1, normalized);
 }
 
+function normalizeSdcpComparablePath(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/\\+/g, '/').replace(/\/+/g, '/').toLowerCase();
+}
+
+function getSdcpPathTail(value: unknown): string {
+  const normalized = normalizeSdcpComparablePath(value);
+  if (!normalized) return '';
+  const parts = normalized.split('/').filter(Boolean);
+  return parts[parts.length - 1] ?? normalized;
+}
+
+function extractSdcpAck(value: unknown): number | null {
+  const candidates: unknown[] = [];
+
+  if (value && typeof value === 'object') {
+    const root = value as Record<string, unknown>;
+    candidates.push(root.Ack, root.ack, root.Code, root.code);
+
+    const nestedData = root.Data;
+    if (nestedData && typeof nestedData === 'object') {
+      const nested = nestedData as Record<string, unknown>;
+      candidates.push(nested.Ack, nested.ack, nested.Code, nested.code);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return null;
+}
+
+function parseSdcpUnknownRecordArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'));
+}
+
+function collectSdcpRecordArraysByKeys(
+  value: unknown,
+  keys: string[],
+  depth: number = 0,
+): Array<Record<string, unknown>> {
+  if (!value || typeof value !== 'object' || depth > 6) return [];
+  const keySet = new Set(keys.map((key) => key.toLowerCase()));
+  const collected: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collected.push(...collectSdcpRecordArraysByKeys(item, keys, depth + 1));
+    }
+    return collected;
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const [key, child] of Object.entries(record)) {
+    if (keySet.has(key.toLowerCase())) {
+      collected.push(...parseSdcpUnknownRecordArray(child));
+    }
+    collected.push(...collectSdcpRecordArraysByKeys(child, keys, depth + 1));
+  }
+
+  return collected;
+}
+
+function parseSdcpMaybeObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function selectSdcpFirstDefined(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(record, key) && record[key] != null) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function parseSdcpPositiveInteger(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.round(parsed);
+}
+
+function parseSdcpPlatePathAndName(entry: Record<string, unknown>): { fullPath: string; name: string } {
+  const rawPath = selectSdcpFirstDefined(entry, ['name', 'Name', 'path', 'Path', 'file', 'File', 'Filename', 'filename']);
+  const fullPathRaw = typeof rawPath === 'string' ? rawPath.trim() : '';
+  const fullPath = fullPathRaw || 'unknown-file';
+  const name = derivePlateNameFromPath(fullPath);
+  return { fullPath, name };
+}
+
+function parseSdcpPlateRecord(entry: Record<string, unknown>): Record<string, unknown> {
+  const { fullPath, name } = parseSdcpPlatePathAndName(entry);
+  const parsedFileData = parseSdcpMaybeObject(selectSdcpFirstDefined(entry, ['file_data', 'fileData']));
+
+  const profileName = selectSdcpFirstDefined(entry, [
+    'ProfileName', 'profileName', 'MaterialName', 'materialName', 'ResinName', 'resinName', 'Profile', 'profile',
+  ]);
+  const profileId = selectSdcpFirstDefined(entry, [
+    'ProfileID', 'profileId', 'profile_id', 'MaterialID', 'materialId',
+  ]);
+
+  const lastModified = selectSdcpFirstDefined(entry, [
+    'LastModified', 'lastModified', 'last_modified', 'MTime', 'mtime', 'ModifyTime', 'modifyTime',
+  ]);
+
+  const layerCount = selectSdcpFirstDefined(entry, [
+    'LayersCount', 'layerCount', 'layer_count', 'TotalLayer', 'totalLayer', 'LayerCount', 'layercount',
+  ]);
+
+  const printTime = selectSdcpFirstDefined(entry, [
+    'PrintTime', 'printTime', 'print_time', 'EstimatedTime', 'estimatedTime', 'estimated_time', 'Duration', 'duration',
+  ]);
+
+  const usedMaterial = selectSdcpFirstDefined(entry, [
+    'UsedMaterial', 'usedMaterial', 'used_material', 'MaterialUsage', 'materialUsage', 'material_usage',
+  ]);
+
+  return {
+    PlateID: parseSdcpPositiveInteger(selectSdcpFirstDefined(entry, ['plateId', 'PlateID', 'plate_id', 'id']))
+      ?? hashPlateIdFromPath(fullPath || name),
+    plateId: parseSdcpPositiveInteger(selectSdcpFirstDefined(entry, ['plateId', 'PlateID', 'plate_id', 'id']))
+      ?? hashPlateIdFromPath(fullPath || name),
+    Path: fullPath,
+    path: fullPath,
+    Name: name,
+    name,
+    ProfileName: typeof profileName === 'string' ? profileName.trim() : undefined,
+    profileName: typeof profileName === 'string' ? profileName.trim() : undefined,
+    ProfileID: profileId,
+    profileId,
+    file_data: parsedFileData ?? undefined,
+    lastModified,
+    LayersCount: layerCount,
+    PrintTime: printTime,
+    UsedMaterial: usedMaterial,
+  };
+}
+
+function parseSdcpTaskDetailsFromResponse(frame: SdcpWsFrame | null): Array<Record<string, unknown>> {
+  const data = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
+  const directTaskDetails = collectSdcpRecordArraysByKeys(data, [
+    'TaskDetailList', 'taskDetailList', 'TaskList', 'taskList', 'HistoryList', 'historyList', 'Data', 'data',
+  ]);
+
+  if (directTaskDetails.length > 0) return directTaskDetails;
+
+  return parseSdcpUnknownRecordArray(data.TaskDetailList ?? data.taskDetailList);
+}
+
+function parseSdcpTaskIdsFromResponse(frame: SdcpWsFrame | null): string[] {
+  const data = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
+  const arrays = [
+    ...(Array.isArray(data.TaskIdList) ? [data.TaskIdList] : []),
+    ...(Array.isArray(data.taskIdList) ? [data.taskIdList] : []),
+    ...(Array.isArray(data.HistoryTaskIdList) ? [data.HistoryTaskIdList] : []),
+    ...(Array.isArray(data.historyTaskIdList) ? [data.historyTaskIdList] : []),
+    ...(Array.isArray(data.TaskList) ? [data.TaskList] : []),
+    ...collectSdcpRecordArraysByKeys(data, ['TaskIdList', 'taskIdList', 'HistoryTaskIdList', 'historyTaskIdList']),
+  ];
+
+  const ids = new Set<string>();
+
+  for (const arrayLike of arrays) {
+    const values = Array.isArray(arrayLike) ? arrayLike : [arrayLike];
+    for (const value of values) {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed) ids.add(trimmed);
+        continue;
+      }
+
+      if (value && typeof value === 'object') {
+        const record = value as Record<string, unknown>;
+        const candidate = selectSdcpFirstDefined(record, ['TaskId', 'taskId', 'ID', 'id']);
+        if (typeof candidate === 'string' && candidate.trim()) ids.add(candidate.trim());
+      }
+    }
+  }
+
+  return Array.from(ids);
+}
+
+function mergeSdcpTaskDetailIntoPlate(
+  plate: Record<string, unknown>,
+  detail: Record<string, unknown>,
+): Record<string, unknown> {
+  const printTime = selectSdcpFirstDefined(detail, [
+    'PrintTime', 'printTime', 'print_time', 'EstimatedTime', 'estimatedTime', 'Duration', 'duration',
+  ]);
+  const usedMaterial = selectSdcpFirstDefined(detail, [
+    'UsedMaterial', 'usedMaterial', 'used_material', 'MaterialUsage', 'materialUsage',
+  ]);
+  const layerCount = selectSdcpFirstDefined(detail, [
+    'LayersCount', 'layerCount', 'layer_count', 'TotalLayer', 'totalLayer',
+  ]);
+  const profileName = selectSdcpFirstDefined(detail, [
+    'ProfileName', 'profileName', 'MaterialName', 'materialName', 'ResinName', 'resinName',
+  ]);
+  const profileId = selectSdcpFirstDefined(detail, [
+    'ProfileID', 'profileId', 'profile_id', 'MaterialID', 'materialId',
+  ]);
+  const lastModified = selectSdcpFirstDefined(detail, [
+    'LastModified', 'lastModified', 'last_modified', 'MTime', 'mtime', 'CompleteTime', 'completeTime',
+  ]);
+
+  const rawFileData = parseSdcpMaybeObject(plate.file_data)
+    ?? parseSdcpMaybeObject(selectSdcpFirstDefined(detail, ['file_data', 'fileData']))
+    ?? {};
+
+  const mergedFileData = {
+    ...rawFileData,
+    ...(layerCount != null ? { layer_count: layerCount } : {}),
+    ...(printTime != null ? { printTime } : {}),
+    ...(usedMaterial != null ? { usedMaterial } : {}),
+    ...(lastModified != null ? { last_modified: lastModified } : {}),
+  };
+
+  return {
+    ...plate,
+    ...(printTime != null ? { PrintTime: printTime } : {}),
+    ...(usedMaterial != null ? { UsedMaterial: usedMaterial } : {}),
+    ...(layerCount != null ? { LayersCount: layerCount } : {}),
+    ...(lastModified != null ? { lastModified } : {}),
+    ...(typeof profileName === 'string' && profileName.trim().length > 0
+      ? {
+          ProfileName: profileName.trim(),
+          profileName: profileName.trim(),
+        }
+      : {}),
+    ...(profileId != null ? { ProfileID: profileId, profileId } : {}),
+    file_data: mergedFileData,
+  };
+}
+
 function parseSdcpWsFrame(data: string): SdcpWsFrame | null {
   try {
     const parsed = JSON.parse(data) as SdcpWsFrame;
@@ -737,7 +990,11 @@ function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
 
 function parseSdcpFileListFromResponse(frame: SdcpWsFrame | null): Array<Record<string, unknown>> {
   const payload = (frame?.Data?.Data ?? {}) as Record<string, unknown>;
-  const fileList = Array.isArray(payload.FileList) ? payload.FileList : [];
+  const fileList = Array.isArray(payload.FileList)
+    ? payload.FileList
+    : Array.isArray(payload.fileList)
+      ? payload.fileList
+      : [];
   return fileList.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'));
 }
 
@@ -1286,22 +1543,62 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
     data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? (payload as any)?.source) },
     timeoutMs: 3200,
   });
-  const payloadData = (response?.Data?.Data ?? {}) as Record<string, unknown>;
-  const ack = Number(payloadData.Ack);
-  const list = parseSdcpFileListFromResponse(response)
-    .filter((entry) => Number(entry.type) === 1)
-    .map((entry) => {
-      const fullPath = typeof entry.name === 'string' ? entry.name.trim() : '';
-      const name = derivePlateNameFromPath(fullPath);
-      return {
-        PlateID: hashPlateIdFromPath(fullPath || name),
-        plateId: hashPlateIdFromPath(fullPath || name),
-        Path: fullPath || name,
-        path: fullPath || name,
-        Name: name,
-        name,
-      };
-    });
+  const listAck = extractSdcpAck(response);
+  const baseList = parseSdcpFileListFromResponse(response)
+    .filter((entry) => {
+      const rawType = Number(entry.type ?? entry.Type ?? 1);
+      return !Number.isFinite(rawType) || rawType === 1;
+    })
+    .map((entry) => parseSdcpPlateRecord(entry));
+
+  const historyResponse = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 320,
+    data: {},
+    timeoutMs: 3200,
+  });
+
+  const historyAck = extractSdcpAck(historyResponse);
+  const historyTaskIds = parseSdcpTaskIdsFromResponse(historyResponse).slice(0, 60);
+
+  const detailResponse = historyTaskIds.length > 0
+    ? await sendSdcpCommandAndAwaitResponse({
+      host: parsedHost.host,
+      port,
+      mainboardId,
+      cmd: 321,
+      data: { TaskIdList: historyTaskIds },
+      timeoutMs: 4200,
+    })
+    : null;
+
+  const detailAck = extractSdcpAck(detailResponse);
+  const taskDetails = parseSdcpTaskDetailsFromResponse(detailResponse);
+
+  const detailByFullPath = new Map<string, Record<string, unknown>>();
+  const detailByTail = new Map<string, Record<string, unknown>>();
+
+  for (const detail of taskDetails) {
+    const detailPathCandidate = selectSdcpFirstDefined(detail, [
+      'Filename', 'filename', 'FileName', 'fileName', 'Path', 'path', 'File', 'file',
+    ]);
+    const normalizedPath = normalizeSdcpComparablePath(detailPathCandidate);
+    const normalizedTail = getSdcpPathTail(detailPathCandidate);
+    if (normalizedPath && !detailByFullPath.has(normalizedPath)) detailByFullPath.set(normalizedPath, detail);
+    if (normalizedTail && !detailByTail.has(normalizedTail)) detailByTail.set(normalizedTail, detail);
+  }
+
+  const list = baseList.map((plate) => {
+    const normalizedPath = normalizeSdcpComparablePath(plate.Path ?? plate.path ?? plate.Name ?? plate.name);
+    const normalizedTail = getSdcpPathTail(plate.Path ?? plate.path ?? plate.Name ?? plate.name);
+    const matchedDetail = detailByFullPath.get(normalizedPath)
+      ?? detailByTail.get(normalizedTail)
+      ?? null;
+    if (!matchedDetail) return plate;
+    return mergeSdcpTaskDetailIntoPlate(plate, matchedDetail);
+  });
 
   const requestedPlateId = Number((payload as any)?.plateId);
   const requestedJobName = typeof (payload as any)?.jobName === 'string' ? (payload as any).jobName.trim().toLowerCase() : '';
@@ -1320,13 +1617,286 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
   return {
     status: 200,
     body: {
-      ok: ack === 0,
+      ok: listAck === 0,
       metadataReady: matchedPlate != null || requestedJobName.length === 0,
       matchedPlate,
       plates: list,
-      error: ack === 0 ? undefined : 'SDCP file list request failed.',
+      error: listAck === 0 ? undefined : 'SDCP file list request failed.',
+      taskHistoryOk: historyAck === null ? null : historyAck === 0,
+      taskDetailOk: detailAck === null ? null : detailAck === 0,
     },
   };
+}
+
+async function handleSdcpPlateDelete(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for delete command.' } };
+  }
+
+  const plateIdRaw = parseSdcpPositiveInteger((payload as any)?.plateId);
+  const directFilename = typeof (payload as any)?.filename === 'string' ? (payload as any).filename.trim() : '';
+  const directPath = typeof (payload as any)?.path === 'string' ? (payload as any).path.trim() : '';
+  const directName = typeof (payload as any)?.jobName === 'string' ? (payload as any).jobName.trim() : '';
+
+  let resolvedPath = directPath || directFilename;
+
+  if (!resolvedPath) {
+    const listResponse = await sendSdcpCommandAndAwaitResponse({
+      host: parsedHost.host,
+      port,
+      mainboardId,
+      cmd: 258,
+      data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? '/local/') },
+      timeoutMs: 3200,
+    });
+
+    const plates = parseSdcpFileListFromResponse(listResponse)
+      .filter((entry) => {
+        const rawType = Number(entry.type ?? entry.Type ?? 1);
+        return !Number.isFinite(rawType) || rawType === 1;
+      })
+      .map((entry) => parseSdcpPlateRecord(entry));
+
+    const normalizedName = normalizeSdcpComparablePath(directName);
+
+    const matched = plates.find((plate) => {
+      const candidatePath = String(plate.Path ?? plate.path ?? '').trim();
+      const candidateId = parseSdcpPositiveInteger(plate.PlateID ?? plate.plateId);
+      if (plateIdRaw != null && candidateId != null && candidateId === plateIdRaw) return true;
+      if (!normalizedName) return false;
+      const comparablePath = normalizeSdcpComparablePath(candidatePath);
+      const comparableTail = getSdcpPathTail(candidatePath);
+      return comparablePath.includes(normalizedName) || comparableTail === normalizedName;
+    }) ?? null;
+
+    resolvedPath = matched ? String(matched.Path ?? matched.path ?? '').trim() : '';
+  }
+
+  if (!resolvedPath) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'Unable to resolve SDCP file path for delete command. Provide path or filename.',
+      },
+    };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 259,
+    data: {
+      FileList: [resolvedPath],
+      FolderList: [],
+    },
+    timeoutMs: 3200,
+  });
+
+  const ack = extractSdcpAck(response);
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      ack,
+      path: resolvedPath,
+      message: ack === 0
+        ? `Deleted SDCP plate file ${resolvedPath}.`
+        : `SDCP plate delete rejected (Ack ${ack == null ? 'unknown' : ack}).`,
+      error: ack === 0 ? undefined : 'SDCP plate delete failed.',
+    },
+  };
+}
+
+async function handleSdcpTaskHistoryList(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for task history command.' } };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 320,
+    data: {},
+    timeoutMs: 3200,
+  });
+  const ack = extractSdcpAck(response);
+  const taskIds = parseSdcpTaskIdsFromResponse(response);
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      ack,
+      taskIds,
+      error: ack === 0 ? undefined : 'SDCP task history request failed.',
+      rawResponse: response ?? null,
+    },
+  };
+}
+
+async function handleSdcpTaskDetails(payload: unknown): Promise<HandlerResult> {
+  const rawHost = typeof (payload as any)?.host === 'string'
+    ? (payload as any).host
+    : typeof (payload as any)?.ipAddress === 'string'
+      ? (payload as any).ipAddress
+      : '';
+  const parsedHost = parseHostAndPort(rawHost);
+  if (!parsedHost) {
+    return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
+  }
+
+  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+    ? String((payload as any).mainboardId).trim()
+    : await resolveMainboardIdForHost(parsedHost.host, port);
+  if (!mainboardId) {
+    return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for task details command.' } };
+  }
+
+  const providedTaskIds = Array.isArray((payload as any)?.taskIds)
+    ? (payload as any).taskIds
+      .filter((value: unknown): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value: string) => value.trim())
+    : [];
+
+  const taskIds = providedTaskIds.length > 0
+    ? providedTaskIds.slice(0, 60)
+    : parseSdcpTaskIdsFromResponse(await sendSdcpCommandAndAwaitResponse({
+      host: parsedHost.host,
+      port,
+      mainboardId,
+      cmd: 320,
+      data: {},
+      timeoutMs: 3200,
+    })).slice(0, 60);
+
+  if (taskIds.length === 0) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        ack: 0,
+        taskIds: [],
+        taskDetails: [],
+      },
+    };
+  }
+
+  const response = await sendSdcpCommandAndAwaitResponse({
+    host: parsedHost.host,
+    port,
+    mainboardId,
+    cmd: 321,
+    data: { TaskIdList: taskIds },
+    timeoutMs: 4200,
+  });
+  const ack = extractSdcpAck(response);
+  const taskDetails = parseSdcpTaskDetailsFromResponse(response);
+
+  return {
+    status: 200,
+    body: {
+      ok: ack === 0,
+      ack,
+      taskIds,
+      taskDetails,
+      error: ack === 0 ? undefined : 'SDCP task detail request failed.',
+      rawResponse: response ?? null,
+    },
+  };
+}
+
+async function resolveSdcpStartFilename(
+  payload: unknown,
+  host: string,
+  port: number,
+  mainboardId: string,
+): Promise<string> {
+  const directFilename = typeof (payload as any)?.filename === 'string'
+    ? (payload as any).filename.trim()
+    : '';
+  if (directFilename) return directFilename;
+
+  const directPath = typeof (payload as any)?.path === 'string'
+    ? (payload as any).path.trim()
+    : '';
+  if (directPath) return directPath;
+
+  const jobName = typeof (payload as any)?.jobName === 'string'
+    ? (payload as any).jobName.trim()
+    : '';
+  if (jobName) {
+    const withExt = jobName.replace(/\.[^.]+$/i, '');
+    return `${withExt}.ctb`;
+  }
+
+  const plateId = parseSdcpPositiveInteger((payload as any)?.plateId);
+  const plateName = typeof (payload as any)?.plateName === 'string'
+    ? (payload as any).plateName.trim()
+    : '';
+  const normalizedPlateName = normalizeSdcpComparablePath(plateName);
+
+  if (plateId == null && !normalizedPlateName) return '';
+
+  const listResponse = await sendSdcpCommandAndAwaitResponse({
+    host,
+    port,
+    mainboardId,
+    cmd: 258,
+    data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? '/local/') },
+    timeoutMs: 3200,
+  });
+
+  const plates = parseSdcpFileListFromResponse(listResponse)
+    .filter((entry) => {
+      const rawType = Number(entry.type ?? entry.Type ?? 1);
+      return !Number.isFinite(rawType) || rawType === 1;
+    })
+    .map((entry) => parseSdcpPlateRecord(entry));
+
+  const matched = plates.find((plate) => {
+    const candidatePath = String(plate.Path ?? plate.path ?? '').trim();
+    const candidateId = parseSdcpPositiveInteger(plate.PlateID ?? plate.plateId);
+    if (plateId != null && candidateId != null && candidateId === plateId) return true;
+    if (!normalizedPlateName) return false;
+    const comparablePath = normalizeSdcpComparablePath(candidatePath);
+    const comparableTail = getSdcpPathTail(candidatePath);
+    return comparablePath.includes(normalizedPlateName) || comparableTail === normalizedPlateName;
+  }) ?? null;
+
+  if (!matched) return '';
+  return String(matched.Path ?? matched.path ?? '').trim();
 }
 
 async function handleSdcpControlOperation(payload: unknown, cmd: number, opLabel: string): Promise<HandlerResult> {
@@ -1350,17 +1920,13 @@ async function handleSdcpControlOperation(payload: unknown, cmd: number, opLabel
 
   const controlData: Record<string, unknown> = {};
   if (cmd === 128) {
-    const filename = typeof (payload as any)?.filename === 'string' && (payload as any).filename.trim().length > 0
-      ? (payload as any).filename.trim()
-      : typeof (payload as any)?.jobName === 'string' && (payload as any).jobName.trim().length > 0
-        ? `${(payload as any).jobName.trim().replace(/\.[^.]+$/i, '')}.ctb`
-        : '';
+    const filename = await resolveSdcpStartFilename(payload, parsedHost.host, port, mainboardId);
     if (!filename) {
       return {
         status: 400,
         body: {
           ok: false,
-          error: 'Start printing requires filename or jobName for SDCP Cmd 128.',
+          error: 'Start printing requires filename/path/jobName, or a resolvable plateId for SDCP Cmd 128.',
         },
       };
     }
@@ -1419,10 +1985,14 @@ export async function handleSdcpV3NetworkOperation(operationPath: string[], payl
   if (op === 'plates/list/json') return handleSdcpPlatesList(payload);
   if (op === 'printer/start') return handleSdcpControlOperation(payload, 128, op);
   if (op === 'printer/pause') return handleSdcpControlOperation(payload, 129, op);
+  if (op === 'printer/cancel') return handleSdcpControlOperation(payload, 130, op);
   if (op === 'printer/stop' || op === 'printer/force-stop') return handleSdcpControlOperation(payload, 130, op);
+  if (op === 'printer/resume') return handleSdcpControlOperation(payload, 131, op);
   if (op === 'printer/unpause') return handleSdcpControlOperation(payload, 131, op);
   if (op === 'upload/chunk') return handleSdcpUploadChunk(payload);
-  if (op === 'plate/delete') return handleUnsupportedSdcpOperation(op);
+  if (op === 'plate/delete') return handleSdcpPlateDelete(payload);
+  if (op === 'task/history/list') return handleSdcpTaskHistoryList(payload);
+  if (op === 'task/details') return handleSdcpTaskDetails(payload);
   if (op === 'materials' || op === 'materials/edit' || op === 'unsupported') return handleUnsupportedSdcpOperation(op);
 
   return { status: 404, body: { error: `Unknown SDCP operation: ${op}` } };
