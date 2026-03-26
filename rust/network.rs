@@ -16,14 +16,21 @@ pub struct PluginNetworkResponse {
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static WEBCAM_STREAM_CACHE: OnceLock<Mutex<HashMap<String, WebcamStreamCacheEntry>>> = OnceLock::new();
+static MAINBOARD_ID_CACHE: OnceLock<Mutex<HashMap<String, MainboardIdCacheEntry>>> = OnceLock::new();
 
 const DEFAULT_SDCP_PORT: u16 = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT: u16 = 3000;
 // const SDCP_STATUS_PROBE_TIMEOUT_MS: u64 = 6_500;
 const SDCP_STATUS_WS_TIMEOUT_MS: u64 = 6_500;
+const MAINBOARD_ID_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
 struct WebcamStreamCacheEntry {
     external_stream_url: String,
+    updated_at: Instant,
+}
+
+struct MainboardIdCacheEntry {
+    mainboard_id: String,
     updated_at: Instant,
 }
 
@@ -33,8 +40,50 @@ fn webcam_stream_cache() -> &'static Mutex<HashMap<String, WebcamStreamCacheEntr
     WEBCAM_STREAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn mainboard_id_cache() -> &'static Mutex<HashMap<String, MainboardIdCacheEntry>> {
+    MAINBOARD_ID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn webcam_cache_key(host: &str, port: u16, mainboard_id: &str) -> String {
     format!("{}:{}:{}", host.trim().to_lowercase(), port, mainboard_id.trim().to_lowercase())
+}
+
+fn mainboard_cache_key(host: &str, port: u16) -> String {
+    format!("{}:{}", host.trim().to_lowercase(), port)
+}
+
+fn read_cached_mainboard_id(host: &str, port: u16) -> Option<String> {
+    let mut cache = mainboard_id_cache().lock().ok()?;
+    let ttl = Duration::from_millis(MAINBOARD_ID_CACHE_TTL_MS);
+    cache.retain(|_, entry| entry.updated_at.elapsed() <= ttl);
+
+    let key = mainboard_cache_key(host, port);
+    let entry = cache.get_mut(&key)?;
+    entry.updated_at = Instant::now();
+
+    let candidate = entry.mainboard_id.trim().to_string();
+    if looks_like_mainboard_id(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn store_cached_mainboard_id(host: &str, port: u16, mainboard_id: &str) {
+    let candidate = mainboard_id.trim().to_string();
+    if !looks_like_mainboard_id(&candidate) {
+        return;
+    }
+
+    if let Ok(mut cache) = mainboard_id_cache().lock() {
+        cache.insert(
+            mainboard_cache_key(host, port),
+            MainboardIdCacheEntry {
+                mainboard_id: candidate,
+                updated_at: Instant::now(),
+            },
+        );
+    }
 }
 
 fn read_cached_webcam_urls(cache_key: &str) -> Option<String> {
@@ -1248,8 +1297,8 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     };
 
     let port = resolve_port(payload.get("port"), parsed.1);
-    let discovery = resolve_sdcp_device_via_udp_discovery(&parsed.0, 1800);
-    let Some(device) = discovery else {
+
+    let Some(probed_device) = probe_sdcp_host(&parsed.0, port, 6500).await else {
         return (
             503,
             json!({
@@ -1275,25 +1324,36 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
         );
     };
 
+    let device = enrich_sdcp_device_identity_via_websocket(probed_device, 1400);
+
     let payload_mainboard = payload
         .get("mainboardId")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let discovery_mainboard = device
-        .get("hostName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+
+    if looks_like_mainboard_id(&payload_mainboard) {
+        store_cached_mainboard_id(&parsed.0, port, &payload_mainboard);
+    }
+
     let mainboard_id = if looks_like_mainboard_id(&payload_mainboard) {
         payload_mainboard
-    } else if looks_like_mainboard_id(&discovery_mainboard) {
-        discovery_mainboard
+    } else if let Some(cached) = read_cached_mainboard_id(&parsed.0, port) {
+        cached
     } else {
-        resolve_mainboard_id_for_host(&parsed.0, port).await
+        let resolved = resolve_mainboard_id_via_websocket(&parsed.0, port, 1600);
+        if looks_like_mainboard_id(&resolved) {
+            store_cached_mainboard_id(&parsed.0, port, &resolved);
+            resolved
+        } else {
+            String::new()
+        }
     };
+
+    if looks_like_mainboard_id(&mainboard_id) {
+        store_cached_mainboard_id(&parsed.0, port, &mainboard_id);
+    }
 
     let (status_frame, attributes_frame) = if mainboard_id.is_empty() {
         (None, None)

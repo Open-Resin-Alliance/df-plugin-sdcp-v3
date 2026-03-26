@@ -36,6 +36,40 @@ type SdcpWsFrame = {
 
 const DEFAULT_SDCP_PORT = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT = 3000;
+const MAINBOARD_ID_CACHE_TTL_MS = 5 * 60 * 1000;
+
+type MainboardIdCacheEntry = {
+  mainboardId: string;
+  updatedAt: number;
+};
+
+const MAINBOARD_ID_CACHE = new Map<string, MainboardIdCacheEntry>();
+
+function getMainboardCacheKey(host: string, port: number): string {
+  return `${host.trim().toLowerCase()}:${Math.max(1, Math.round(port))}`;
+}
+
+function readCachedMainboardId(host: string, port: number): string {
+  const key = getMainboardCacheKey(host, port);
+  const cached = MAINBOARD_ID_CACHE.get(key);
+  if (!cached) return '';
+
+  if ((Date.now() - cached.updatedAt) > MAINBOARD_ID_CACHE_TTL_MS) {
+    MAINBOARD_ID_CACHE.delete(key);
+    return '';
+  }
+
+  return looksLikeMainboardId(cached.mainboardId) ? cached.mainboardId : '';
+}
+
+function storeCachedMainboardId(host: string, port: number, mainboardId: string): void {
+  const normalized = mainboardId.trim();
+  if (!looksLikeMainboardId(normalized)) return;
+  MAINBOARD_ID_CACHE.set(getMainboardCacheKey(host, port), {
+    mainboardId: normalized,
+    updatedAt: Date.now(),
+  });
+}
 
 function parseHostAndPort(value: string): { host: string; port: number } | null {
   const trimmed = value.trim();
@@ -1026,8 +1060,8 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   }
 
   const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const discovery = await resolveSdcpDeviceViaDiscovery(parsedHost.host, 1800);
-  if (!discovery) {
+  const probed = await probeSdcpHost(parsedHost.host, port, 6500);
+  if (!probed) {
     return {
       status: 503,
       body: {
@@ -1052,74 +1086,29 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       },
     };
   }
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
+
+  const payloadMainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
     ? String((payload as any).mainboardId).trim()
-    : (looksLikeMainboardId(discovery.hostName) ? discovery.hostName.trim() : await resolveMainboardIdForHost(parsedHost.host, port));
+    : '';
+  if (payloadMainboardId) {
+    storeCachedMainboardId(parsedHost.host, port, payloadMainboardId);
+  }
+
+  const cachedMainboardId = readCachedMainboardId(parsedHost.host, port);
+  const resolvedMainboardId = payloadMainboardId
+    || cachedMainboardId
+    || await resolveMainboardIdViaWebSocket(parsedHost.host, port, 1600);
+  const mainboardId = looksLikeMainboardId(resolvedMainboardId)
+    ? resolvedMainboardId.trim()
+    : '';
+  if (mainboardId) {
+    storeCachedMainboardId(parsedHost.host, port, mainboardId);
+  }
+
   const telemetry = mainboardId
     ? await requestSdcpStatusAndAttributes({ host: parsedHost.host, port, mainboardId, timeoutMs: 6500 })
     : { statusFrame: null, attributesFrame: null };
   const printInfo = extractPrintInfoFromStatusFrame(telemetry.statusFrame);
-
-  const probed = await probeSdcpHost(parsedHost.host, port, 6500);
-  if (!probed) {
-    if (telemetry.statusFrame || telemetry.attributesFrame) {
-      const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
-      const firmwareVersionFromAttrs = typeof attributes?.FirmwareVersion === 'string'
-        ? attributes.FirmwareVersion.trim()
-        : '';
-
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          connected: true,
-          mode: 'sdcp',
-          hostName: parsedHost.host,
-          printerName: 'SDCP Printer',
-          printerModel: 'SDCP 3.0.0',
-          ipAddress: parsedHost.host,
-          port,
-          mainboardId,
-          firmwareVersion: firmwareVersionFromAttrs,
-          stateText: printInfo.stateText || 'Online',
-          statusText: 'SDCP telemetry reachable; HTTP probe timed out.',
-          state: printInfo.state || 'online',
-          isPrinting: printInfo.isPrinting,
-          isPaused: printInfo.isPaused,
-          progressPct: printInfo.progressPct,
-          currentLayer: printInfo.currentLayer,
-          totalLayers: printInfo.totalLayers,
-          plateId: printInfo.taskId ? hashPlateIdFromPath(printInfo.taskId) : null,
-          jobName: printInfo.jobName,
-          etaSec: printInfo.etaSec,
-        },
-      };
-    }
-
-    return {
-      status: 503,
-      body: {
-        ok: false,
-        connected: false,
-        mode: 'sdcp',
-        hostName: parsedHost.host,
-        printerName: '',
-        ipAddress: parsedHost.host,
-        port,
-        stateText: 'Offline',
-        statusText: 'SDCP host unreachable',
-        state: 'offline',
-        isPrinting: false,
-        isPaused: false,
-        progressPct: null,
-        currentLayer: null,
-        totalLayers: null,
-        plateId: null,
-        jobName: null,
-        etaSec: null,
-      },
-    };
-  }
 
   const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probed, 1400);
 
