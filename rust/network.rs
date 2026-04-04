@@ -696,9 +696,429 @@ fn parse_sdcp_task_details_from_response(frame: &Value) -> Vec<Value> {
 
 fn is_sdcp_task_status_active(task_status: Option<i64>) -> bool {
     match task_status {
-        Some(status) => status != 1 && status != 2 && status != 3,
+        // SDCP docs describe: 0=Other, 1=Completed, 2=Exceptional, 3=Stopped.
+        // Some firmware reports 1 while task is still running, so only explicit
+        // exceptional/stopped states are treated as terminal.
+        Some(status) => status != 2 && status != 3,
         None => false,
     }
+}
+
+fn extract_sdcp_non_negative_i64_field(record: &Value, keys: &[&str]) -> Option<i64> {
+    extract_sdcp_i64_field(record, keys).filter(|value| *value >= 0)
+}
+
+fn extract_sdcp_positive_i64_field(record: &Value, keys: &[&str]) -> Option<i64> {
+    extract_sdcp_i64_field(record, keys).filter(|value| *value > 0)
+}
+
+fn parse_sdcp_progress_percent_value(value: &Value) -> Option<f64> {
+    let mut numeric = value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))?;
+    if !numeric.is_finite() || numeric < 0.0 {
+        return None;
+    }
+    if numeric <= 1.0 {
+        numeric *= 100.0;
+    }
+    Some(numeric.clamp(0.0, 100.0))
+}
+
+fn parse_sdcp_loose_f64_value(value: &Value) -> Option<f64> {
+    if let Some(numeric) = value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))
+    {
+        return if numeric.is_finite() { Some(numeric) } else { None };
+    }
+
+    let raw = value.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let normalized = if raw.contains(',') && raw.contains('.') {
+        raw.replace(',', "")
+    } else {
+        raw.replace(',', ".")
+    };
+
+    if let Ok(parsed) = normalized.parse::<f64>() {
+        if parsed.is_finite() {
+            return Some(parsed);
+        }
+    }
+
+    let mut token = String::new();
+    let mut started = false;
+    let mut seen_dot = false;
+
+    for ch in normalized.chars() {
+        if !started && (ch == '-' || ch.is_ascii_digit()) {
+            token.push(ch);
+            started = true;
+            continue;
+        }
+
+        if started {
+            if ch.is_ascii_digit() {
+                token.push(ch);
+                continue;
+            }
+            if ch == '.' && !seen_dot {
+                token.push(ch);
+                seen_dot = true;
+                continue;
+            }
+            break;
+        }
+    }
+
+    if token.is_empty() || token == "-" || token == "." || token == "-." {
+        return None;
+    }
+
+    token.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn parse_sdcp_positive_f64_value(value: &Value) -> Option<f64> {
+    let numeric = parse_sdcp_loose_f64_value(value)?;
+    if !numeric.is_finite() || numeric <= 0.0 {
+        return None;
+    }
+    Some(numeric)
+}
+
+fn extract_sdcp_positive_f64_field(record: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| record.get(*key).and_then(parse_sdcp_positive_f64_value))
+}
+
+fn is_likely_sdcp_total_layer_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized.contains("bottom")
+        || normalized.contains("firstlayer")
+        || normalized.contains("transition")
+        || normalized.contains("current")
+        || normalized.contains("already")
+        || normalized.contains("printed")
+    {
+        return false;
+    }
+
+    if [
+        "totallayer",
+        "totallayers",
+        "totallayercount",
+        "layercount",
+        "layerscount",
+        "layertotal",
+        "totalprintlayer",
+        "slicelayercount",
+    ]
+    .contains(&normalized.as_str())
+    {
+        return true;
+    }
+
+    normalized.contains("layer")
+        && (normalized.contains("count") || normalized.contains("total"))
+}
+
+fn collect_sdcp_total_layer_candidates(value: &Value, out: &mut Vec<i64>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_sdcp_total_layer_candidates(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                if is_likely_sdcp_total_layer_key(key) {
+                    let parsed = child
+                        .as_i64()
+                        .or_else(|| child.as_u64().and_then(|v| i64::try_from(v).ok()))
+                        .or_else(|| child.as_f64().map(|v| v.round() as i64));
+                    if let Some(value) = parsed.filter(|v| *v > 0) {
+                        out.push(value);
+                    }
+                }
+                collect_sdcp_total_layer_candidates(child, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_sdcp_best_total_layer_candidate(candidates: &[i64], current_layer: Option<i64>) -> Option<i64> {
+    let mut unique: Vec<i64> = candidates.iter().copied().filter(|v| *v > 0).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.is_empty() {
+        return None;
+    }
+
+    if let Some(current) = current_layer.filter(|v| *v >= 0) {
+        let compatible: Vec<i64> = unique.into_iter().filter(|candidate| *candidate >= current).collect();
+        return compatible.into_iter().max();
+    }
+
+    unique.into_iter().max()
+}
+
+fn is_likely_sdcp_current_layer_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized.contains("bottom")
+        || normalized.contains("firstlayer")
+        || normalized.contains("transition")
+        || normalized.contains("count")
+        || normalized.contains("total")
+        || normalized == "layer"
+        || normalized == "layers"
+    {
+        return false;
+    }
+
+    normalized == "currentlayer"
+        || normalized == "printedlayer"
+        || (normalized.contains("current") && normalized.contains("layer"))
+        || (normalized.contains("printed") && normalized.contains("layer"))
+}
+
+fn collect_sdcp_current_layer_candidates(value: &Value, out: &mut Vec<i64>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_sdcp_current_layer_candidates(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                if is_likely_sdcp_current_layer_key(key) {
+                    let parsed = child
+                        .as_i64()
+                        .or_else(|| child.as_u64().and_then(|v| i64::try_from(v).ok()))
+                        .or_else(|| child.as_f64().map(|v| v.round() as i64));
+                    if let Some(value) = parsed.filter(|v| *v >= 0) {
+                        out.push(value);
+                    }
+                }
+                collect_sdcp_current_layer_candidates(child, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_sdcp_best_current_layer_candidate(candidates: &[i64], total_layers: Option<i64>) -> Option<i64> {
+    let mut unique: Vec<i64> = candidates.iter().copied().filter(|v| *v >= 0).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.is_empty() {
+        return None;
+    }
+
+    if let Some(total) = total_layers.filter(|v| *v > 0) {
+        let compatible: Vec<i64> = unique.iter().copied().filter(|candidate| *candidate <= total).collect();
+        if !compatible.is_empty() {
+            return compatible.into_iter().max();
+        }
+    }
+
+    unique.into_iter().max()
+}
+
+fn extract_sdcp_layer_progress_from_task_detail(detail: Option<&Value>) -> (Option<i64>, Option<i64>, Option<f64>) {
+    let Some(detail) = detail else {
+        return (None, None, None);
+    };
+
+    let slice_info = detail
+        .get("SliceInformation")
+        .or_else(|| detail.get("sliceInformation"))
+        .or_else(|| detail.get("SliceInfo"))
+        .or_else(|| detail.get("sliceInfo"));
+
+    let explicit_progress = ["Progress", "progress", "ProgressPct", "progressPct", "PrintProgress", "printProgress", "TaskProgress", "taskProgress"]
+        .iter()
+        .find_map(|key| detail.get(*key).and_then(parse_sdcp_progress_percent_value));
+
+    let end_time = extract_sdcp_non_negative_i64_field(
+        detail,
+        &["EndTime", "endTime", "FinishTime", "finishTime", "CompleteTime", "completeTime"],
+    );
+    let task_likely_ended = matches!(end_time, Some(value) if value > 0);
+
+    let direct_current_layer = extract_sdcp_non_negative_i64_field(
+        detail,
+        &[
+            "CurrentLayer", "currentLayer", "current_layer",
+            "PrintedLayer", "printedLayer", "printed_layer",
+        ],
+    );
+    let already_printed_layer = extract_sdcp_non_negative_i64_field(
+        detail,
+        &["AlreadyPrintLayer", "alreadyPrintLayer", "already_print_layer"],
+    );
+
+    let direct_total_layers = extract_sdcp_positive_i64_field(
+        detail,
+        &[
+            "TotalLayer", "totalLayer", "LayerCount", "layerCount", "LayersCount", "layersCount", "layer_count", "TotalLayers", "totalLayers",
+            "total_layer", "total_layers",
+            "total_layer_numbers", "totalLayerNumbers",
+            "TotalLayerCount", "totalLayerCount", "LayerTotal", "layerTotal", "TotalPrintLayer", "totalPrintLayer",
+            "SliceLayerCount", "sliceLayerCount", "slice_layer_count",
+        ],
+    )
+    .or_else(|| {
+        slice_info.and_then(|info| {
+            extract_sdcp_positive_i64_field(
+                info,
+                &[
+                    "TotalLayer", "totalLayer", "LayerCount", "layerCount", "LayersCount", "layersCount", "layer_count", "TotalLayers", "totalLayers",
+                    "total_layer", "total_layers",
+                    "total_layer_numbers", "totalLayerNumbers",
+                    "TotalLayerCount", "totalLayerCount", "LayerTotal", "layerTotal", "TotalPrintLayer", "totalPrintLayer",
+                    "SliceLayerCount", "sliceLayerCount", "slice_layer_count",
+                ],
+            )
+        })
+    });
+
+    let mut recursive_candidates: Vec<i64> = Vec::new();
+    collect_sdcp_total_layer_candidates(detail, &mut recursive_candidates, 0);
+    if let Some(info) = slice_info {
+        collect_sdcp_total_layer_candidates(info, &mut recursive_candidates, 0);
+    }
+    let recursive_total_layers = select_sdcp_best_total_layer_candidate(&recursive_candidates, direct_current_layer);
+    let total_layers = direct_total_layers.or(recursive_total_layers);
+
+    let mut recursive_current_candidates: Vec<i64> = Vec::new();
+    collect_sdcp_current_layer_candidates(detail, &mut recursive_current_candidates, 0);
+    if let Some(info) = slice_info {
+        collect_sdcp_current_layer_candidates(info, &mut recursive_current_candidates, 0);
+    }
+    let printed_volume_ml = extract_sdcp_positive_f64_field(
+        detail,
+        &[
+            "CurrentLayerTalVolume", "CurrentLayerTotalVolume",
+            "currentLayerTalVolume", "currentLayerTotalVolume",
+            "PrintedVolume", "printedVolume",
+        ],
+    );
+    let model_volume_ml = slice_info.and_then(|info| {
+        extract_sdcp_positive_f64_field(
+            info,
+            &["volume", "Volume", "modelVolume", "model_volume"],
+        )
+    });
+    let volume_progress_pct = match (printed_volume_ml, model_volume_ml) {
+        (Some(printed), Some(total)) if total > 0.0 => Some(((printed / total) * 100.0).clamp(0.0, 100.0)),
+        _ => None,
+    };
+    let volume_derived_current_layer = match (volume_progress_pct, total_layers) {
+        (Some(progress), Some(total)) if total > 0 => {
+            let raw = (((progress / 100.0) * total as f64).round() as i64).min(total);
+            if raw > 0 { Some(raw) } else { None }
+        }
+        _ => None,
+    };
+    let progress_derived_current_layer = match (explicit_progress, total_layers) {
+        (Some(progress), Some(total)) if total > 0 => {
+            let raw = (((progress / 100.0) * total as f64).round() as i64).min(total);
+            if raw > 0 { Some(raw) } else { None }
+        }
+        _ => None,
+    };
+    let already_printed_layer_candidate = match (already_printed_layer, total_layers) {
+        (Some(already), None) => Some(already),
+        (Some(already), Some(total)) if total <= 0 => Some(already),
+        (Some(already), Some(total)) if already < total => Some(already),
+        (Some(already), Some(total)) if already > total => None,
+        (Some(already), Some(_total)) => {
+            let near_complete = matches!(explicit_progress, Some(progress) if progress >= 99.5)
+                || matches!(volume_progress_pct, Some(progress) if progress >= 99.5)
+                || task_likely_ended;
+            if near_complete { Some(already) } else { None }
+        }
+        _ => None,
+    };
+    let suspicious_direct_current = match (direct_current_layer, total_layers, volume_progress_pct) {
+        (Some(current), Some(total), _) if current >= total => {
+            matches!(explicit_progress, Some(progress) if progress < 99.5)
+                || matches!(volume_progress_pct, Some(progress) if progress < 99.5)
+                || (!task_likely_ended && explicit_progress.is_none() && volume_progress_pct.is_none())
+        }
+        _ => false,
+    };
+    let current_layer = if suspicious_direct_current { None } else { direct_current_layer }
+        .or(select_sdcp_best_current_layer_candidate(&recursive_current_candidates, total_layers))
+        .or(volume_derived_current_layer)
+        .or(progress_derived_current_layer)
+        .or(already_printed_layer_candidate);
+
+    let derived_progress = match (current_layer, total_layers) {
+        (Some(current), Some(total)) if total > 0 => Some(((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0)),
+        _ => None,
+    };
+
+    (current_layer, total_layers, explicit_progress.or(derived_progress).or(volume_progress_pct))
+}
+
+fn is_sdcp_task_detail_likely_active(detail: Option<&Value>) -> bool {
+    let Some(detail) = detail else {
+        return false;
+    };
+
+    let end_time = extract_sdcp_i64_field(detail, &["EndTime", "endTime", "FinishTime", "finishTime", "CompleteTime", "completeTime"]);
+    if end_time.unwrap_or(0) > 0 {
+        return false;
+    }
+
+    let task_status = extract_sdcp_i64_field(detail, &["TaskStatus", "taskStatus", "Status", "status"]);
+    if matches!(task_status, Some(2 | 3)) {
+        return false;
+    }
+
+    let has_task_identity = extract_sdcp_string_field(detail, &["TaskId", "taskId", "Id", "id"])
+        .is_some()
+        || extract_sdcp_string_field(detail, &["Filename", "filename", "FileName", "fileName", "Path", "path", "File", "file"])
+            .is_some()
+        || extract_sdcp_string_field(detail, &["TaskName", "taskName", "Name", "name"])
+            .is_some();
+    let begin_time = extract_sdcp_i64_field(detail, &["BeginTime", "beginTime", "StartTime", "startTime"]);
+    let printed_layer = extract_sdcp_i64_field(detail, &["AlreadyPrintLayer", "alreadyPrintLayer", "CurrentLayer", "currentLayer"]);
+
+    has_task_identity || begin_time.is_some() || printed_layer.is_some() || task_status.is_some()
 }
 
 fn resolve_sdcp_active_task_detail(task_details: &[Value], task_id: Option<&str>, job_name: Option<&str>) -> Option<Value> {
@@ -737,6 +1157,13 @@ fn resolve_sdcp_active_task_detail(task_details: &[Value], task_id: Option<&str>
         }) {
             return Some(found.clone());
         }
+    }
+
+    if let Some(found) = task_details
+        .iter()
+        .find(|detail| is_sdcp_task_detail_likely_active(Some(detail)))
+    {
+        return Some(found.clone());
     }
 
     task_details.first().cloned()
@@ -1204,11 +1631,20 @@ fn request_sdcp_status_and_attributes(
 
 fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
     let status_obj = status_frame
-        .and_then(|f| f.pointer("/Data/Status"))
+        .and_then(|f| {
+            f.pointer("/Data/Status")
+                .or_else(|| f.pointer("/Status"))
+                .or_else(|| f.pointer("/Data"))
+        })
         .cloned()
         .unwrap_or_else(|| json!({}));
     let print_info = status_frame
-        .and_then(|f| f.pointer("/Data/Status/PrintInfo"))
+        .and_then(|f| {
+            f.pointer("/Data/Status/PrintInfo")
+                .or_else(|| f.pointer("/Status/PrintInfo"))
+                .or_else(|| f.pointer("/Data/PrintInfo"))
+                .or_else(|| f.pointer("/PrintInfo"))
+        })
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -1231,8 +1667,23 @@ fn extract_print_info_from_status_frame(status_frame: Option<&Value>) -> Value {
         .any(|status| *status == 2 || *status == 3 || *status == 4);
 
     let print_status = print_info.get("Status").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let current_layer = print_info.get("CurrentLayer").and_then(|v| v.as_i64());
-    let total_layers = print_info.get("TotalLayer").and_then(|v| v.as_i64());
+    let current_layer = extract_sdcp_non_negative_i64_field(
+        &print_info,
+        &[
+            "CurrentLayer", "currentLayer", "current_layer",
+            "AlreadyPrintLayer", "alreadyPrintLayer", "already_print_layer",
+            "PrintedLayer", "printedLayer", "printed_layer",
+        ],
+    );
+    let total_layers = extract_sdcp_positive_i64_field(
+        &print_info,
+        &[
+            "TotalLayer", "totalLayer", "LayerCount", "layerCount", "LayersCount", "layersCount", "layer_count", "TotalLayers", "totalLayers",
+            "total_layer", "total_layers",
+            "TotalLayerCount", "totalLayerCount", "LayerTotal", "layerTotal", "TotalPrintLayer", "totalPrintLayer",
+            "SliceLayerCount", "sliceLayerCount", "slice_layer_count",
+        ],
+    );
     let current_ticks = print_info.get("CurrentTicks").and_then(|v| v.as_i64());
     let total_ticks = print_info.get("TotalTicks").and_then(|v| v.as_i64());
     let filename = print_info
@@ -1553,6 +2004,13 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let parsed = match parse_host_and_port(&raw_host) {
         Some(parsed) => parsed,
         None => {
+            eprintln!(
+                "[sdcp-v3][printer/status] invalid-host {}",
+                json!({
+                    "rawHost": raw_host,
+                    "payloadMainboardId": payload.get("mainboardId").and_then(|v| v.as_str()).unwrap_or("").trim(),
+                })
+            );
             return (
                 400,
                 json!({
@@ -1567,6 +2025,13 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let port = resolve_port(payload.get("port"), parsed.1);
 
     let Some(probed_device) = probe_sdcp_host(&parsed.0, port, 6500).await else {
+        eprintln!(
+            "[sdcp-v3][printer/status] probe-failed {}",
+            json!({
+                "host": parsed.0,
+                "port": port,
+            })
+        );
         return (
             503,
             json!({
@@ -1610,7 +2075,7 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     } else if let Some(cached) = read_cached_mainboard_id(&parsed.0, port) {
         cached
     } else {
-        let resolved = resolve_mainboard_id_via_websocket(&parsed.0, port, 1600);
+        let resolved = resolve_mainboard_id_for_host(&parsed.0, port).await;
         if looks_like_mainboard_id(&resolved) {
             store_cached_mainboard_id(&parsed.0, port, &resolved);
             resolved
@@ -1659,7 +2124,6 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
                 .take(20)
                 .collect::<Vec<_>>()
         };
-
         if !task_ids.is_empty() {
             let detail_response = send_sdcp_command_and_await_response(
                 &parsed.0,
@@ -1692,7 +2156,6 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let active_task_status = active_task_detail
         .as_ref()
         .and_then(|detail| extract_sdcp_i64_field(detail, &["TaskStatus", "taskStatus", "Status", "status"]));
-    let active_task_running = is_sdcp_task_status_active(active_task_status);
     let active_task_thumbnail = active_task_detail
         .as_ref()
         .and_then(|detail| extract_sdcp_string_field(detail, &["Thumbnail", "thumbnail", "ThumbnailUrl", "thumbnailUrl", "ThumbnailPath", "thumbnailPath"]));
@@ -1705,6 +2168,57 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let active_task_name = active_task_detail
         .as_ref()
         .and_then(|detail| extract_sdcp_string_field(detail, &["TaskName", "taskName", "Name", "name"]));
+    let has_current_task_identity = print_info
+        .get("taskId")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || print_info
+            .get("jobName")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+    let has_active_task_heuristic = is_sdcp_task_detail_likely_active(active_task_detail.as_ref());
+    let has_resolved_active_task_identity = active_task_id.is_some()
+        || active_task_path.is_some()
+        || active_task_name.is_some();
+    let active_task_definitely_ended = active_task_detail.is_some() && !has_active_task_heuristic;
+    let active_task_running = !active_task_definitely_ended
+        && (has_current_task_identity || has_active_task_heuristic || has_resolved_active_task_identity)
+        && is_sdcp_task_status_active(active_task_status);
+    let (task_detail_current_layer, task_detail_total_layers, task_detail_progress_pct) =
+        extract_sdcp_layer_progress_from_task_detail(active_task_detail.as_ref());
+
+    let print_info_current_layer = print_info
+        .get("currentLayer")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0);
+    let print_info_total_layers = print_info
+        .get("totalLayers")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0);
+    let print_info_progress_pct = print_info
+        .get("progressPct")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.clamp(0.0, 100.0));
+
+    let resolved_current_layer = print_info_current_layer.or(task_detail_current_layer);
+    let suspicious_task_detail_total = print_info_total_layers.is_none()
+        && active_task_running
+        && resolved_current_layer.is_some()
+        && resolved_current_layer.unwrap_or(0) > 0
+        && task_detail_total_layers.is_some()
+        && task_detail_total_layers.unwrap_or(0) <= resolved_current_layer.unwrap_or(0);
+    let resolved_total_layers = print_info_total_layers
+        .or_else(|| if suspicious_task_detail_total { None } else { task_detail_total_layers });
+    let resolved_progress_pct = print_info_progress_pct
+        .or_else(|| match (resolved_current_layer, resolved_total_layers) {
+            (Some(current), Some(total)) if total > 0 => {
+                Some(((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+            }
+            _ => if resolved_total_layers.is_some() { task_detail_progress_pct } else { None },
+        });
 
     let print_info_is_printing = print_info
         .get("isPrinting")
@@ -1742,7 +2256,7 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .or(active_task_name)
+        .or(active_task_name.clone())
         .or_else(|| {
             active_task_path.as_ref().map(|path| {
                 path
@@ -1767,7 +2281,10 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
 
     let firmware_from_attrs = attributes_frame
         .as_ref()
-        .and_then(|f| f.pointer("/Data/Attributes/FirmwareVersion"))
+        .and_then(|f| {
+            f.pointer("/Data/Attributes/FirmwareVersion")
+                .or_else(|| f.pointer("/Attributes/FirmwareVersion"))
+        })
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -1795,9 +2312,9 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
             "state": resolved_state,
             "isPrinting": resolved_is_printing,
             "isPaused": print_info_is_paused,
-            "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
-            "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
-            "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
+            "progressPct": resolved_progress_pct,
+            "currentLayer": resolved_current_layer,
+            "totalLayers": resolved_total_layers,
             "plateId": resolved_plate_key
                 .as_ref()
                 .map(|v| Value::from(hash_plate_id_from_path(v)))

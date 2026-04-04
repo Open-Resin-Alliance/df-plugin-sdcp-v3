@@ -364,6 +364,34 @@ function parseSdcpNonNegativeInteger(value: unknown): number | null {
   return Math.round(parsed);
 }
 
+function parseSdcpLooseNumber(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const normalized = (trimmed.includes(',') && trimmed.includes('.'))
+    ? trimmed.replace(/,/g, '')
+    : trimmed.replace(/,/g, '.');
+
+  const direct = Number(normalized);
+  if (Number.isFinite(direct)) return direct;
+
+  const token = normalized.match(/-?\d+(?:\.\d+)?/);
+  if (!token) return null;
+  const parsed = Number(token[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseSdcpPositiveNumber(value: unknown): number | null {
+  const parsed = parseSdcpLooseNumber(value);
+  if (parsed == null || !Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
 function parseSdcpPlatePathAndName(entry: Record<string, unknown>): { fullPath: string; name: string } {
   const rawPath = selectSdcpFirstDefined(entry, ['name', 'Name', 'path', 'Path', 'file', 'File', 'Filename', 'filename']);
   const fullPathRaw = typeof rawPath === 'string' ? rawPath.trim() : '';
@@ -532,8 +560,287 @@ function extractSdcpStringFromRecord(record: Record<string, unknown>, keys: stri
 
 function isSdcpTaskStatusActive(taskStatus: number | null): boolean {
   if (taskStatus == null) return false;
-  // SDCP v3 Cmd 321: 1=Completed, 2=Exceptional, 3=Stopped. Other values are active/non-terminal.
-  return taskStatus !== 1 && taskStatus !== 2 && taskStatus !== 3;
+  // SDCP v3 docs describe: 0=Other, 1=Completed, 2=Exceptional, 3=Stopped.
+  // In practice, some firmware reports TaskStatus=1 while the job is still active.
+  // Treat only explicit terminal failure/stop states as non-active.
+  return taskStatus !== 2 && taskStatus !== 3;
+}
+
+function isSdcpTaskDetailLikelyActive(detail: Record<string, unknown> | null): boolean {
+  if (!detail) return false;
+
+  const endTime = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'EndTime', 'endTime', 'FinishTime', 'finishTime', 'CompleteTime', 'completeTime',
+  ]));
+  if (endTime != null && endTime > 0) return false;
+
+  const taskStatus = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'TaskStatus', 'taskStatus', 'Status', 'status',
+  ]));
+  if (taskStatus === 2 || taskStatus === 3) return false;
+
+  const hasTaskIdentity = Boolean(
+    extractSdcpStringFromRecord(detail, ['TaskId', 'taskId', 'Id', 'id'])
+    || extractSdcpStringFromRecord(detail, ['Filename', 'filename', 'FileName', 'fileName', 'Path', 'path', 'File', 'file'])
+    || extractSdcpStringFromRecord(detail, ['TaskName', 'taskName', 'Name', 'name']),
+  );
+  const beginTime = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, ['BeginTime', 'beginTime', 'StartTime', 'startTime']));
+  const printedLayer = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'AlreadyPrintLayer', 'alreadyPrintLayer', 'CurrentLayer', 'currentLayer',
+  ]));
+
+  return hasTaskIdentity || beginTime != null || printedLayer != null || taskStatus != null;
+}
+
+function parseSdcpProgressPercent(raw: unknown): number | null {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  if (value < 0) return null;
+  if (value <= 1) return Math.max(0, Math.min(100, value * 100));
+  return Math.max(0, Math.min(100, value));
+}
+
+function isLikelySdcpTotalLayerKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) return false;
+
+  if (
+    normalized.includes('bottom')
+    || normalized.includes('firstlayer')
+    || normalized.includes('transition')
+    || normalized.includes('current')
+    || normalized.includes('already')
+    || normalized.includes('printed')
+  ) {
+    return false;
+  }
+
+  if ([
+    'totallayer', 'totallayers', 'totallayercount', 'layercount', 'layerscount',
+    'layertotal', 'totalprintlayer', 'slicelayercount',
+  ].includes(normalized)) {
+    return true;
+  }
+
+  return normalized.includes('layer')
+    && (normalized.includes('count') || normalized.includes('total'));
+}
+
+function collectSdcpTotalLayerCandidates(value: unknown, depth: number = 0): number[] {
+  if (!value || depth > 8) return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectSdcpTotalLayerCandidates(item, depth + 1));
+  }
+
+  if (typeof value !== 'object') return [];
+
+  const out: number[] = [];
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (isLikelySdcpTotalLayerKey(key)) {
+      const parsed = parseSdcpPositiveInteger(child);
+      if (parsed != null) out.push(parsed);
+    }
+    out.push(...collectSdcpTotalLayerCandidates(child, depth + 1));
+  }
+
+  return out;
+}
+
+function selectSdcpBestTotalLayerCandidate(candidates: number[], currentLayer: number | null): number | null {
+  const unique = Array.from(new Set(candidates.filter((v) => Number.isFinite(v) && v > 0)));
+  if (unique.length === 0) return null;
+
+  if (currentLayer != null && currentLayer >= 0) {
+    const compatible = unique.filter((candidate) => candidate >= currentLayer);
+    if (compatible.length === 0) return null;
+    return Math.max(...compatible);
+  }
+
+  return Math.max(...unique);
+}
+
+function isLikelySdcpCurrentLayerKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normalized) return false;
+
+  if (
+    normalized.includes('bottom')
+    || normalized.includes('firstlayer')
+    || normalized.includes('transition')
+    || normalized.includes('count')
+    || normalized.includes('total')
+    || normalized === 'layer'
+    || normalized === 'layers'
+  ) {
+    return false;
+  }
+
+  return normalized === 'currentlayer'
+    || normalized === 'printedlayer'
+    || (normalized.includes('current') && normalized.includes('layer'))
+    || (normalized.includes('printed') && normalized.includes('layer'));
+}
+
+function collectSdcpCurrentLayerCandidates(value: unknown, depth: number = 0): number[] {
+  if (!value || depth > 8) return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectSdcpCurrentLayerCandidates(item, depth + 1));
+  }
+
+  if (typeof value !== 'object') return [];
+
+  const out: number[] = [];
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (isLikelySdcpCurrentLayerKey(key)) {
+      const parsed = parseSdcpNonNegativeInteger(child);
+      if (parsed != null) out.push(parsed);
+    }
+    out.push(...collectSdcpCurrentLayerCandidates(child, depth + 1));
+  }
+
+  return out;
+}
+
+function selectSdcpBestCurrentLayerCandidate(candidates: number[], totalLayers: number | null): number | null {
+  const unique = Array.from(new Set(candidates.filter((v) => Number.isFinite(v) && v >= 0)));
+  if (unique.length === 0) return null;
+
+  if (totalLayers != null && totalLayers > 0) {
+    const compatible = unique.filter((candidate) => candidate <= totalLayers);
+    if (compatible.length > 0) return Math.max(...compatible);
+  }
+
+  return Math.max(...unique);
+}
+
+function extractSdcpLayerProgressFromTaskDetail(detail: Record<string, unknown> | null): {
+  currentLayer: number | null;
+  totalLayers: number | null;
+  progressPct: number | null;
+} {
+  if (!detail) {
+    return { currentLayer: null, totalLayers: null, progressPct: null };
+  }
+
+  const sliceInformation = parseSdcpMaybeObject(selectSdcpFirstDefined(detail, [
+    'SliceInformation', 'sliceInformation', 'SliceInfo', 'sliceInfo',
+  ]));
+
+  const explicitProgress = parseSdcpProgressPercent(selectSdcpFirstDefined(detail, [
+    'Progress', 'progress', 'ProgressPct', 'progressPct', 'PrintProgress', 'printProgress', 'TaskProgress', 'taskProgress',
+  ]));
+
+  const endTime = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'EndTime', 'endTime', 'FinishTime', 'finishTime', 'CompleteTime', 'completeTime',
+  ]));
+  const taskLikelyEnded = endTime != null && endTime > 0;
+
+  const directCurrentLayer = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'CurrentLayer', 'currentLayer', 'current_layer',
+    'PrintedLayer', 'printedLayer', 'printed_layer',
+  ]));
+  const alreadyPrintedLayer = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(detail, [
+    'AlreadyPrintLayer', 'alreadyPrintLayer', 'already_print_layer',
+  ]));
+
+  const directTotalLayers = parseSdcpPositiveInteger(
+    selectSdcpFirstDefined(detail, [
+      'TotalLayer', 'totalLayer', 'LayerCount', 'layerCount', 'LayersCount', 'layersCount', 'layer_count', 'TotalLayers', 'totalLayers',
+      'total_layer', 'total_layers',
+      'total_layer_numbers', 'totalLayerNumbers',
+      'TotalLayerCount', 'totalLayerCount', 'LayerTotal', 'layerTotal', 'TotalPrintLayer', 'totalPrintLayer',
+      'SliceLayerCount', 'sliceLayerCount', 'slice_layer_count',
+    ])
+      ?? selectSdcpFirstDefined(sliceInformation ?? {}, [
+        'TotalLayer', 'totalLayer', 'LayerCount', 'layerCount', 'LayersCount', 'layersCount', 'layer_count', 'TotalLayers', 'totalLayers',
+        'total_layer', 'total_layers',
+        'total_layer_numbers', 'totalLayerNumbers',
+        'TotalLayerCount', 'totalLayerCount', 'LayerTotal', 'layerTotal', 'TotalPrintLayer', 'totalPrintLayer',
+        'SliceLayerCount', 'sliceLayerCount', 'slice_layer_count',
+      ]),
+  );
+
+  const recursiveTotalLayers = selectSdcpBestTotalLayerCandidate(
+    [
+      ...collectSdcpTotalLayerCandidates(detail),
+      ...collectSdcpTotalLayerCandidates(sliceInformation),
+    ],
+    directCurrentLayer,
+  );
+
+  const totalLayers = directTotalLayers ?? recursiveTotalLayers;
+  const recursiveCurrentLayer = selectSdcpBestCurrentLayerCandidate(
+    [
+      ...collectSdcpCurrentLayerCandidates(detail),
+      ...collectSdcpCurrentLayerCandidates(sliceInformation),
+    ],
+    totalLayers,
+  );
+  const printedVolumeMl = parseSdcpPositiveNumber(selectSdcpFirstDefined(detail, [
+    'CurrentLayerTalVolume', 'CurrentLayerTotalVolume',
+    'currentLayerTalVolume', 'currentLayerTotalVolume',
+    'PrintedVolume', 'printedVolume',
+  ]));
+  const modelVolumeMl = parseSdcpPositiveNumber(selectSdcpFirstDefined(sliceInformation ?? {}, [
+    'volume', 'Volume', 'modelVolume', 'model_volume',
+  ]));
+  const volumeProgressPct = (
+    printedVolumeMl != null
+    && modelVolumeMl != null
+    && modelVolumeMl > 0
+  ) ? Math.max(0, Math.min(100, (printedVolumeMl / modelVolumeMl) * 100)) : null;
+  const volumeDerivedCurrentLayer = (() => {
+    if (volumeProgressPct == null || totalLayers == null || totalLayers <= 0) return null;
+    const raw = Math.min(totalLayers, Math.round((volumeProgressPct / 100) * totalLayers));
+    return raw > 0 ? raw : null;
+  })();
+  const progressDerivedCurrentLayer = (() => {
+    if (explicitProgress == null || totalLayers == null || totalLayers <= 0) return null;
+    const raw = Math.min(totalLayers, Math.round((explicitProgress / 100) * totalLayers));
+    return raw > 0 ? raw : null;
+  })();
+  const alreadyPrintedLayerCandidate = (() => {
+    if (alreadyPrintedLayer == null) return null;
+    if (totalLayers == null || totalLayers <= 0) return alreadyPrintedLayer;
+    if (alreadyPrintedLayer < totalLayers) return alreadyPrintedLayer;
+    if (alreadyPrintedLayer > totalLayers) return null;
+
+    const nearComplete = (
+      (explicitProgress != null && explicitProgress >= 99.5)
+      || (volumeProgressPct != null && volumeProgressPct >= 99.5)
+      || taskLikelyEnded
+    );
+    return nearComplete ? alreadyPrintedLayer : null;
+  })();
+  const suspiciousDirectCurrent = (
+    directCurrentLayer != null
+    && totalLayers != null
+    && directCurrentLayer >= totalLayers
+    && (
+      (explicitProgress != null && explicitProgress < 99.5)
+      || (volumeProgressPct != null && volumeProgressPct < 99.5)
+      || (!taskLikelyEnded && explicitProgress == null && volumeProgressPct == null)
+    )
+  );
+  const currentLayer = (suspiciousDirectCurrent ? null : directCurrentLayer)
+    ?? recursiveCurrentLayer
+    ?? volumeDerivedCurrentLayer
+    ?? progressDerivedCurrentLayer
+    ?? alreadyPrintedLayerCandidate;
+
+  const derivedProgress = (
+    currentLayer != null
+    && totalLayers != null
+    && totalLayers > 0
+  ) ? Math.max(0, Math.min(100, (currentLayer / totalLayers) * 100)) : null;
+
+  return {
+    currentLayer,
+    totalLayers,
+    progressPct: explicitProgress ?? derivedProgress ?? volumeProgressPct,
+  };
 }
 
 function resolveSdcpActiveTaskDetail(args: {
@@ -566,6 +873,9 @@ function resolveSdcpActiveTaskDetail(args: {
     });
     if (matchedByFilename) return matchedByFilename;
   }
+
+  const matchedByActiveHeuristic = taskDetails.find((detail) => isSdcpTaskDetailLikelyActive(detail));
+  if (matchedByActiveHeuristic) return matchedByActiveHeuristic;
 
   return taskDetails[0] ?? null;
 }
@@ -985,8 +1295,14 @@ function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
   jobName: string | null;
   taskId: string | null;
 } {
-  const status = (frame?.Data as any)?.Status as Record<string, unknown> | undefined;
-  const printInfo = (status?.PrintInfo as Record<string, unknown> | undefined) ?? {};
+  const frameRecord = parseSdcpMaybeObject(frame as unknown);
+  const frameData = parseSdcpMaybeObject(frameRecord?.Data);
+  const status = parseSdcpMaybeObject(frameData?.Status)
+    ?? parseSdcpMaybeObject(frameRecord?.Status);
+  const printInfo = parseSdcpMaybeObject(status?.PrintInfo)
+    ?? parseSdcpMaybeObject(frameData?.PrintInfo)
+    ?? parseSdcpMaybeObject(frameRecord?.PrintInfo)
+    ?? {};
   const currentMachineStatusRaw = status?.CurrentStatus;
   const currentMachineStatuses = Array.isArray(currentMachineStatusRaw)
     ? currentMachineStatusRaw.map((value) => Number(value)).filter((value) => Number.isFinite(value))
@@ -995,8 +1311,17 @@ function extractPrintInfoFromStatusFrame(frame: SdcpWsFrame | null): {
   const machineStatusProcessing = currentMachineStatuses.some((value) => value === 2 || value === 3 || value === 4);
 
   const printStatus = Number(printInfo.Status);
-  const currentLayer = Number.isFinite(Number(printInfo.CurrentLayer)) ? Number(printInfo.CurrentLayer) : null;
-  const totalLayers = Number.isFinite(Number(printInfo.TotalLayer)) ? Number(printInfo.TotalLayer) : null;
+  const currentLayer = parseSdcpNonNegativeInteger(selectSdcpFirstDefined(printInfo, [
+    'CurrentLayer', 'currentLayer', 'current_layer',
+    'AlreadyPrintLayer', 'alreadyPrintLayer', 'already_print_layer',
+    'PrintedLayer', 'printedLayer', 'printed_layer',
+  ]));
+  const totalLayers = parseSdcpPositiveInteger(selectSdcpFirstDefined(printInfo, [
+    'TotalLayer', 'totalLayer', 'LayerCount', 'layerCount', 'LayersCount', 'layersCount', 'layer_count', 'TotalLayers', 'totalLayers',
+    'total_layer', 'total_layers',
+    'TotalLayerCount', 'totalLayerCount', 'LayerTotal', 'layerTotal', 'TotalPrintLayer', 'totalPrintLayer',
+    'SliceLayerCount', 'sliceLayerCount', 'slice_layer_count',
+  ]));
   const currentTicks = Number.isFinite(Number(printInfo.CurrentTicks)) ? Number(printInfo.CurrentTicks) : null;
   const totalTicks = Number.isFinite(Number(printInfo.TotalTicks)) ? Number(printInfo.TotalTicks) : null;
   const fileName = typeof printInfo.Filename === 'string' && printInfo.Filename.trim().length > 0
@@ -1391,12 +1716,20 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
+    console.info('[sdcp-v3][printer/status] invalid-host', {
+      rawHost,
+      payloadMainboardId: typeof (payload as any)?.mainboardId === 'string' ? String((payload as any).mainboardId).trim() : '',
+    });
     return { status: 400, body: { ok: false, connected: false, error: 'Invalid host or IP address' } };
   }
 
   const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
   const probed = await probeSdcpHost(parsedHost.host, port, 6500);
   if (!probed) {
+    console.info('[sdcp-v3][printer/status] probe-failed', {
+      host: parsedHost.host,
+      port,
+    });
     return {
       status: 503,
       body: {
@@ -1432,7 +1765,7 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   const cachedMainboardId = readCachedMainboardId(parsedHost.host, port);
   const resolvedMainboardId = payloadMainboardId
     || cachedMainboardId
-    || await resolveMainboardIdViaWebSocket(parsedHost.host, port, 1600);
+    || await resolveMainboardIdForHost(parsedHost.host, port);
   const mainboardId = looksLikeMainboardId(resolvedMainboardId)
     ? resolvedMainboardId.trim()
     : '';
@@ -1447,6 +1780,8 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
 
   let taskDetailAck: number | null = null;
   let activeTaskDetail: Record<string, unknown> | null = null;
+  let taskIdsUsed: string[] = [];
+  let taskDetailsCount = 0;
 
   if (mainboardId) {
     const explicitTaskIds = printInfo.taskId ? [printInfo.taskId] : [];
@@ -1460,6 +1795,7 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
         data: {},
         timeoutMs: 3200,
       })).slice(0, 20);
+    taskIdsUsed = taskIds;
 
     if (taskIds.length > 0) {
       const detailResponse = await sendSdcpCommandAndAwaitResponse({
@@ -1472,6 +1808,7 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       });
       taskDetailAck = extractSdcpAck(detailResponse);
       const taskDetails = parseSdcpTaskDetailsFromResponse(detailResponse);
+      taskDetailsCount = taskDetails.length;
       activeTaskDetail = resolveSdcpActiveTaskDetail({
         taskDetails,
         taskId: printInfo.taskId,
@@ -1483,7 +1820,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   const activeTaskStatus = activeTaskDetail
     ? parseSdcpNonNegativeInteger(selectSdcpFirstDefined(activeTaskDetail, ['TaskStatus', 'taskStatus', 'Status', 'status']))
     : null;
-  const activeTaskRunning = isSdcpTaskStatusActive(activeTaskStatus);
   const activeTaskThumbnailPath = activeTaskDetail
     ? extractSdcpStringFromRecord(activeTaskDetail, ['Thumbnail', 'thumbnail', 'ThumbnailUrl', 'thumbnailUrl', 'ThumbnailPath', 'thumbnailPath'])
     : null;
@@ -1496,6 +1832,64 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
   const activeTaskName = activeTaskDetail
     ? extractSdcpStringFromRecord(activeTaskDetail, ['TaskName', 'taskName', 'Name', 'name'])
     : null;
+  const activeTaskSliceInformation = activeTaskDetail
+    ? parseSdcpMaybeObject(selectSdcpFirstDefined(activeTaskDetail, ['SliceInformation', 'sliceInformation', 'SliceInfo', 'sliceInfo']))
+    : null;
+  const activeTaskKeys = activeTaskDetail ? Object.keys(activeTaskDetail) : [];
+  const activeTaskSliceInfoKeys = activeTaskSliceInformation ? Object.keys(activeTaskSliceInformation) : [];
+  const activeTaskAlreadyPrintLayer = activeTaskDetail
+    ? parseSdcpNonNegativeInteger(selectSdcpFirstDefined(activeTaskDetail, [
+      'AlreadyPrintLayer', 'alreadyPrintLayer', 'already_print_layer',
+    ]))
+    : null;
+  const activeTaskCurrentLayerTalVolume = activeTaskDetail
+    ? parseSdcpPositiveNumber(selectSdcpFirstDefined(activeTaskDetail, [
+      'CurrentLayerTalVolume', 'CurrentLayerTotalVolume',
+      'currentLayerTalVolume', 'currentLayerTotalVolume',
+      'PrintedVolume', 'printedVolume',
+    ]))
+    : null;
+  const activeTaskSliceVolume = activeTaskSliceInformation
+    ? parseSdcpPositiveNumber(selectSdcpFirstDefined(activeTaskSliceInformation, [
+      'volume', 'Volume', 'modelVolume', 'model_volume',
+    ]))
+    : null;
+  const hasCurrentTaskIdentity = Boolean(printInfo.taskId || printInfo.jobName);
+  const hasActiveTaskHeuristic = isSdcpTaskDetailLikelyActive(activeTaskDetail);
+  const hasResolvedActiveTaskIdentity = Boolean(activeTaskId || activeTaskPath || activeTaskName);
+  // If we have task detail and it explicitly says the task ended (EndTime set), don't treat as active.
+  const activeTaskDefinitelyEnded = activeTaskDetail != null && !hasActiveTaskHeuristic;
+  const activeTaskRunning = !activeTaskDefinitelyEnded
+    && (hasCurrentTaskIdentity || hasActiveTaskHeuristic || hasResolvedActiveTaskIdentity)
+    && isSdcpTaskStatusActive(activeTaskStatus);
+  const taskDetailLayerProgress = extractSdcpLayerProgressFromTaskDetail(activeTaskDetail);
+
+  const resolvedCurrentLayerRaw = printInfo.currentLayer ?? taskDetailLayerProgress.currentLayer;
+  const resolvedCurrentLayer = resolvedCurrentLayerRaw != null && resolvedCurrentLayerRaw > 0
+    ? Math.round(resolvedCurrentLayerRaw)
+    : null;
+  const totalLayersFromPrintInfo = printInfo.totalLayers != null && printInfo.totalLayers > 0
+    ? Math.round(printInfo.totalLayers)
+    : null;
+  const totalLayersFromTaskDetail = taskDetailLayerProgress.totalLayers != null && taskDetailLayerProgress.totalLayers > 0
+    ? Math.round(taskDetailLayerProgress.totalLayers)
+    : null;
+  const suspiciousTaskDetailTotal = totalLayersFromPrintInfo == null
+    && activeTaskRunning
+    && resolvedCurrentLayer != null
+    && resolvedCurrentLayer > 0
+    && totalLayersFromTaskDetail != null
+    && totalLayersFromTaskDetail <= resolvedCurrentLayer;
+  const resolvedTotalLayers = totalLayersFromPrintInfo
+    ?? (suspiciousTaskDetailTotal ? null : totalLayersFromTaskDetail);
+  const resolvedProgressPct = printInfo.progressPct
+    ?? (
+      resolvedCurrentLayer != null
+      && resolvedTotalLayers != null
+      && resolvedTotalLayers > 0
+    ? Math.max(0, Math.min(100, (resolvedCurrentLayer / resolvedTotalLayers) * 100))
+    : (resolvedTotalLayers != null ? taskDetailLayerProgress.progressPct : null)
+    );
 
   const resolvedIsPrinting = printInfo.isPrinting || activeTaskRunning;
   const resolvedState = printInfo.isPaused
@@ -1519,7 +1913,10 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
 
   const enriched = await enrichSdcpDeviceIdentityViaWebSocket(probed, 1400);
 
-  const attributes = (telemetry.attributesFrame?.Data as any)?.Attributes as Record<string, unknown> | undefined;
+  const attributesFrameRecord = parseSdcpMaybeObject(telemetry.attributesFrame as unknown);
+  const attributesData = parseSdcpMaybeObject(attributesFrameRecord?.Data);
+  const attributes = parseSdcpMaybeObject(attributesData?.Attributes)
+    ?? parseSdcpMaybeObject(attributesFrameRecord?.Attributes);
   const firmwareVersionFromAttrs = typeof attributes?.FirmwareVersion === 'string'
     ? attributes.FirmwareVersion.trim()
     : '';
@@ -1542,9 +1939,9 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       state: resolvedState || enriched.state || 'online',
       isPrinting: resolvedIsPrinting,
       isPaused: printInfo.isPaused,
-      progressPct: printInfo.progressPct,
-      currentLayer: printInfo.currentLayer,
-      totalLayers: printInfo.totalLayers,
+      progressPct: resolvedProgressPct,
+      currentLayer: resolvedCurrentLayer,
+      totalLayers: resolvedTotalLayers,
       plateId: resolvedPlateKey ? hashPlateIdFromPath(resolvedPlateKey) : null,
       jobName: resolvedJobName,
       etaSec: printInfo.etaSec,

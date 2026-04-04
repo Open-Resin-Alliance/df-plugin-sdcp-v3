@@ -114,7 +114,8 @@ export function resolveSdcpMonitoringSnapshot(payload: unknown): SdcpMonitoringS
   const isPrinting = parsedPrinting ?? (/\bprinting\b/.test(stateNormalized) && !isPaused);
 
   const progressPct = normalizePercent(toFiniteNumber(root.progressPct ?? root.progress ?? root.percent ?? root.completion));
-  const currentLayer = toFiniteNumber(root.currentLayer ?? root.layer);
+  const currentLayerRaw = toFiniteNumber(root.currentLayer ?? root.layer);
+  const currentLayer = currentLayerRaw != null && currentLayerRaw > 0 ? Math.round(currentLayerRaw) : null;
   const totalLayers = toFiniteNumber(root.totalLayers ?? root.layers);
   const plateId = toFiniteNumber(root.plateId ?? root.plate_id);
   const etaSec = toFiniteNumber(root.etaSec ?? root.eta ?? root.remainingSec);
