@@ -1,6 +1,7 @@
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{Mutex, OnceLock};
@@ -1886,7 +1887,11 @@ async fn sdcp_connect(payload: &Value) -> (u16, Value) {
     let port = resolve_port(payload.get("port"), parsed.1);
     match probe_sdcp_host(&parsed.0, port, 3500).await {
         Some(device) => {
-            let enriched = enrich_sdcp_device_identity_via_websocket(device, 1800);
+            // enrich_sdcp_device_identity_via_websocket uses synchronous tungstenite
+            // (blocking up to 1800 ms). Move it off the async executor thread.
+            let enriched = tokio::task::spawn_blocking(move || enrich_sdcp_device_identity_via_websocket(device, 1800))
+                .await
+                .unwrap_or_else(|_| json!({}));
             (
             200,
             json!({
@@ -1948,7 +1953,14 @@ async fn sdcp_discover(payload: &Value) -> (u16, Value) {
         .map(|v| v.clamp(250, 8000))
         .unwrap_or(1200);
 
-    let mut devices = discover_sdcp_devices_via_udp(probe_timeout_ms);
+    info!("[sdcp/discover] starting UDP broadcast (timeout={}ms)", probe_timeout_ms);
+    // discover_sdcp_devices_via_udp blocks on a UDP socket for the full probe_timeout_ms.
+    // Running synchronous socket work on a dedicated blocking thread prevents stalling
+    // the Tokio executor and keeps the Tauri/tao event loop alive on Windows.
+    let mut devices = tokio::task::spawn_blocking(move || discover_sdcp_devices_via_udp(probe_timeout_ms))
+        .await
+        .unwrap_or_default();
+    info!("[sdcp/discover] UDP broadcast complete: {} device(s) found", devices.len());
 
     // Optional fallback probe for manually supplied host when UDP is blocked.
     let raw_host = resolve_raw_host(payload);
@@ -1974,10 +1986,22 @@ async fn sdcp_discover(payload: &Value) -> (u16, Value) {
         }
     }
 
-    devices = devices
+    // Enrich each device in parallel using blocking threads — sequential enrichment
+    // (each taking up to 1500 ms via tungstenite) would hold the executor for N×1500 ms.
+    info!("[sdcp/discover] enriching {} device(s) in parallel", devices.len());
+    let handles: Vec<_> = devices
         .into_iter()
-        .map(|device| enrich_sdcp_device_identity_via_websocket(device, 1500))
+        .map(|device| tokio::task::spawn_blocking(move || enrich_sdcp_device_identity_via_websocket(device, 1500)))
         .collect();
+    let mut enriched = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(device) => enriched.push(device),
+            Err(e) => warn!("[sdcp/discover] enrichment task panicked: {e}"),
+        }
+    }
+    devices = enriched;
+    info!("[sdcp/discover] enrichment complete");
 
     (
         200,
@@ -2004,7 +2028,7 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let parsed = match parse_host_and_port(&raw_host) {
         Some(parsed) => parsed,
         None => {
-            eprintln!(
+            warn!(
                 "[sdcp-v3][printer/status] invalid-host {}",
                 json!({
                     "rawHost": raw_host,
@@ -2025,7 +2049,7 @@ async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
     let port = resolve_port(payload.get("port"), parsed.1);
 
     let Some(probed_device) = probe_sdcp_host(&parsed.0, port, 6500).await else {
-        eprintln!(
+        warn!(
             "[sdcp-v3][printer/status] probe-failed {}",
             json!({
                 "host": parsed.0,
