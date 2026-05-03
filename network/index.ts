@@ -1,4 +1,4 @@
-import { pluginNetworkFetch } from '@/utils/pluginNetworkBridge';
+import { pluginNetworkFetch, readNativeFileChunk, readNativeFileSize } from '@/utils/pluginNetworkBridge';
 
 type UploadProgressEvent = {
   loaded: number;
@@ -68,21 +68,18 @@ async function uploadSdcpChunk(args: {
   fileName: string;
   totalSize: number;
   offset: number;
-  chunk: Blob;
+  chunkBytes: Uint8Array;
 }): Promise<void> {
-  const { hostUrl, uuid, fileName, totalSize, offset, chunk } = args;
+  const { hostUrl, uuid, fileName, totalSize, offset, chunkBytes } = args;
   const parsed = new URL(hostUrl);
   const chunkBase64 = (() => {
-    return chunk.arrayBuffer().then((buffer) => {
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      const step = 0x8000;
-      for (let i = 0; i < bytes.length; i += step) {
-        const view = bytes.subarray(i, i + step);
-        binary += String.fromCharCode(...view);
-      }
-      return btoa(binary);
-    });
+    let binary = '';
+    const step = 0x8000;
+    for (let i = 0; i < chunkBytes.length; i += step) {
+      const view = chunkBytes.subarray(i, i + step);
+      binary += String.fromCharCode(...view);
+    }
+    return btoa(binary);
   })();
 
   const response = await pluginNetworkFetch({
@@ -94,13 +91,17 @@ async function uploadSdcpChunk(args: {
     fileName,
     totalSize,
     offset,
-    chunkBase64: await chunkBase64,
+    chunkBase64,
   });
 
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || !(body as any)?.ok) {
-    const error = typeof (body as any)?.error === 'string'
-      ? (body as any).error
+  const bodyRaw: unknown = await response.json().catch((): unknown => ({}));
+  const body = (bodyRaw && typeof bodyRaw === 'object'
+    ? bodyRaw
+    : null) as { ok?: unknown; error?: unknown } | null;
+
+  if (!response.ok || body?.ok !== true) {
+    const error = typeof body?.error === 'string'
+      ? body.error
       : `SDCP upload chunk failed (HTTP ${response.status})`;
     throw new Error(error);
   }
@@ -108,15 +109,32 @@ async function uploadSdcpChunk(args: {
 
 export async function uploadPrintJobWithProgress(args: {
   hostUrl: string;
-  zipBlob: Blob;
+  zipBlob?: Blob | null;
+  zipFilePath?: string | null;
   path: string;
   profileId: string;
   callbacks: UploadCallbacks;
 }): Promise<{ ok: boolean; plateId: number | null }> {
-  const { hostUrl, zipBlob, path, callbacks } = args;
+  const { hostUrl, zipBlob, zipFilePath, path, callbacks } = args;
 
   const resolvedHostUrl = toHostUrl(hostUrl);
-  const totalSize = zipBlob.size;
+  const normalizedPath = typeof zipFilePath === 'string' ? zipFilePath.trim() : '';
+  const hasBlobPayload = Boolean(zipBlob && zipBlob.size > 0);
+  const hasPathPayload = normalizedPath.length > 0;
+  if (!hasBlobPayload && !hasPathPayload) {
+    throw new Error('No SDCP upload payload available.');
+  }
+
+  const totalSize = hasBlobPayload
+    ? Number(zipBlob!.size)
+    : await (async () => {
+      const size = await readNativeFileSize(normalizedPath);
+      if (size == null || !Number.isFinite(size) || size <= 0) {
+        throw new Error('Failed to read SDCP upload file size from native path.');
+      }
+      return Number(size);
+    })();
+
   const fileName = `${(path || 'dragonfruit_job').trim() || 'dragonfruit_job'}.ctb`;
   const uploadUuid = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -133,14 +151,23 @@ export async function uploadPrintJobWithProgress(args: {
     let offset = 0;
     while (offset < totalSize) {
       const chunkEnd = Math.min(totalSize, offset + SDCP_UPLOAD_CHUNK_BYTES);
-      const chunk = zipBlob.slice(offset, chunkEnd);
+      const chunkBytes = hasBlobPayload
+        ? new Uint8Array(await zipBlob!.slice(offset, chunkEnd).arrayBuffer())
+        : await (async () => {
+          const bytes = await readNativeFileChunk(normalizedPath, offset, chunkEnd - offset);
+          if (!bytes || bytes.byteLength === 0) {
+            throw new Error('Failed to read SDCP upload chunk from native file path.');
+          }
+          return bytes;
+        })();
+
       await uploadSdcpChunk({
         hostUrl: resolvedHostUrl,
         uuid: uploadUuid,
         fileName,
         totalSize,
         offset,
-        chunk,
+        chunkBytes,
       });
 
       offset = chunkEnd;
