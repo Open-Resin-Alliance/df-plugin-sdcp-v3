@@ -1,3 +1,5 @@
+mod mqtt;
+
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,6 +20,7 @@ pub struct PluginNetworkResponse {
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static WEBCAM_STREAM_CACHE: OnceLock<Mutex<HashMap<String, WebcamStreamCacheEntry>>> = OnceLock::new();
 static MAINBOARD_ID_CACHE: OnceLock<Mutex<HashMap<String, MainboardIdCacheEntry>>> = OnceLock::new();
+static MQTT_STATE: OnceLock<Mutex<Option<MqttState>>> = OnceLock::new();
 
 const DEFAULT_SDCP_PORT: u16 = 3030;
 const DEFAULT_SDCP_DISCOVERY_PORT: u16 = 3000;
@@ -33,6 +36,20 @@ struct WebcamStreamCacheEntry {
 struct MainboardIdCacheEntry {
     mainboard_id: String,
     updated_at: Instant,
+}
+
+struct MqttState {
+    stream: std::net::TcpStream,
+    mainboard_id: String,
+    printer_ip: String,
+}
+
+fn mqtt_state() -> &'static Mutex<Option<MqttState>> {
+    MQTT_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn is_mqtt_connected() -> bool {
+    mqtt_state().lock().ok().map(|g| g.is_some()).unwrap_or(false)
 }
 
 const WEBCAM_STREAM_CACHE_TTL_MS: u64 = 45_000;
@@ -1343,6 +1360,60 @@ fn resolve_mainboard_id_via_websocket(host: &str, port: u16, timeout_ms: u64) ->
     String::new()
 }
 
+async fn sdcp_upload_mqtt_file(payload: &Value) -> (u16, Value) {
+    if !is_mqtt_connected() {
+        return (400, json!({ "ok": false, "error": "No active MQTT connection; use upload/chunk for WebSocket printers" }));
+    }
+
+    let file_name = payload
+        .get("fileName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let file_b64 = payload
+        .get("fileBase64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if file_name.is_empty() || file_b64.is_empty() {
+        return (400, json!({ "ok": false, "error": "fileName and fileBase64 are required" }));
+    }
+
+    let file_bytes = match base64::engine::general_purpose::STANDARD.decode(file_b64.as_bytes()) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return (400, json!({ "ok": false, "error": "Invalid fileBase64" })),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut state = mqtt_state().lock().ok()?;
+        let m = state.as_mut()?;
+        mqtt::mqtt_upload_file(
+            &mut m.stream,
+            &m.mainboard_id,
+            &file_name,
+            file_bytes,
+            Duration::from_secs(120),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match result {
+        Some(response) => {
+            let ack = response
+                .pointer("/Data/Data/Ack")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            (200, json!({ "ok": ack == 0, "ack": ack, "rawResponse": response }))
+        }
+        None => (502, json!({ "ok": false, "error": "MQTT file upload failed or timed out" })),
+    }
+}
+
 async fn sdcp_upload_chunk(payload: &Value) -> (u16, Value) {
     let raw_host = resolve_raw_host(payload);
     let parsed = match parse_host_and_port(&raw_host) {
@@ -1885,6 +1956,33 @@ async fn sdcp_connect(payload: &Value) -> (u16, Value) {
     };
 
     let port = resolve_port(payload.get("port"), parsed.1);
+    let host = parsed.0.clone();
+
+    // Try UDP discovery first to check firmware version for MQTT detection.
+    let h = host.clone();
+    let discovered = tokio::task::spawn_blocking(move || {
+        discover_sdcp_devices_via_udp(1800)
+            .into_iter()
+            .find(|d| {
+                d.get("ipAddress")
+                    .and_then(|v| v.as_str())
+                    .map(|ip| ip.eq_ignore_ascii_case(&h))
+                    .unwrap_or(false)
+            })
+    })
+    .await
+    .unwrap_or(None);
+
+    let firmware_version = discovered
+        .as_ref()
+        .and_then(|d| d.get("firmwareVersion").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    if mqtt::is_mqtt_firmware(&firmware_version) {
+        return sdcp_connect_via_mqtt(&host, port, &firmware_version, discovered.as_ref()).await;
+    }
+
     match probe_sdcp_host(&parsed.0, port, 3500).await {
         Some(device) => {
             // enrich_sdcp_device_identity_via_websocket uses synchronous tungstenite
@@ -1922,6 +2020,105 @@ async fn sdcp_connect(payload: &Value) -> (u16, Value) {
                 "firmwareVersion": "",
             }),
         ),
+    }
+}
+
+async fn sdcp_connect_via_mqtt(
+    printer_ip: &str,
+    port: u16,
+    firmware_version: &str,
+    discovered: Option<&Value>,
+) -> (u16, Value) {
+    let ip = printer_ip.to_string();
+    let fw = firmware_version.to_string();
+    let printer_name = discovered
+        .and_then(|d| d.get("printerName").and_then(|v| v.as_str()))
+        .unwrap_or("SDCP Printer")
+        .to_string();
+    let printer_model = discovered
+        .and_then(|d| d.get("printerModel").and_then(|v| v.as_str()))
+        .unwrap_or("SDCP 1.0")
+        .to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let listener = std::net::TcpListener::bind(
+            format!("0.0.0.0:{}", mqtt::MQTT_BROKER_PORT)
+        )
+        .map_err(|e| format!("failed to bind MQTT broker port: {e}"))?;
+
+        mqtt::send_mqtt_trigger(&ip, mqtt::MQTT_BROKER_PORT)
+            .map_err(|e| format!("failed to send MQTT UDP trigger: {e}"))?;
+
+        let (mut stream, client_id) =
+            mqtt::accept_mqtt_client(&listener, Duration::from_secs(12))
+                .map_err(|e| format!("MQTT accept failed: {e}"))?;
+
+        // Try to get mainboard_id from ClientID; fall back to polling for first publish topic.
+        let mainboard_id = if looks_like_mainboard_id(&client_id) {
+            client_id
+        } else {
+            match mqtt::mqtt_poll_topic(&mut stream, "/sdcp/", Duration::from_secs(3)) {
+                Some((topic, _)) => topic
+                    .trim_end_matches('/')
+                    .split('/')
+                    .last()
+                    .unwrap_or("")
+                    .to_string(),
+                None => client_id,
+            }
+        };
+
+        Ok::<_, String>((stream, mainboard_id))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((stream, mainboard_id))) => {
+            if let Ok(mut state) = mqtt_state().lock() {
+                *state = Some(MqttState {
+                    stream,
+                    mainboard_id: mainboard_id.clone(),
+                    printer_ip: printer_ip.to_string(),
+                });
+            }
+            info!("[sdcp/connect] MQTT connected to {printer_ip}, mainboard_id={mainboard_id}");
+            (
+                200,
+                json!({
+                    "connected": true,
+                    "mode": "sdcp",
+                    "hostName": mainboard_id,
+                    "printerName": printer_name,
+                    "printerModel": printer_model,
+                    "ipAddress": printer_ip,
+                    "port": port,
+                    "statusText": "Connected via MQTT",
+                    "state": "online",
+                    "firmwareVersion": fw,
+                }),
+            )
+        }
+        Ok(Err(e)) => {
+            warn!("[sdcp/connect] MQTT connect failed for {printer_ip}: {e}");
+            (
+                503,
+                json!({
+                    "connected": false,
+                    "mode": "sdcp",
+                    "hostName": printer_ip,
+                    "printerName": "",
+                    "ipAddress": printer_ip,
+                    "port": port,
+                    "statusText": format!("MQTT connect failed: {e}"),
+                    "state": "",
+                    "firmwareVersion": fw,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("[sdcp/connect] MQTT spawn_blocking panicked for {printer_ip}: {e}");
+            (500, json!({ "connected": false, "error": "MQTT connect task panicked" }))
+        }
     }
 }
 
@@ -2023,7 +2220,78 @@ async fn sdcp_discover(payload: &Value) -> (u16, Value) {
     )
 }
 
+async fn sdcp_mqtt_printer_status() -> (u16, Value) {
+    let result = tokio::task::spawn_blocking(|| {
+        let mut state = mqtt_state().lock().ok()?;
+        let m = state.as_mut()?;
+        let mainboard_id = m.mainboard_id.clone();
+        let printer_ip = m.printer_ip.clone();
+
+        let response = mqtt::mqtt_send_command_await_response(
+            &mut m.stream,
+            &mainboard_id,
+            0,
+            json!({}),
+            Duration::from_secs(6),
+        )?;
+
+        Some((mainboard_id, printer_ip, response))
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some((mainboard_id, printer_ip, mut frame)) = result else {
+        return (503, json!({ "ok": false, "connected": false, "error": "MQTT status request failed or timed out" }));
+    };
+
+    // Normalise V1.0.0 status shape (CurrentStatus: number→[number], Status remap).
+    if let Some(inner) = frame.pointer_mut("/Data/Data") {
+        mqtt::normalize_v1_status(inner);
+    }
+
+    // Reshape to the format extract_print_info_from_status_frame expects.
+    let status_data = frame.pointer("/Data/Data").cloned().unwrap_or_else(|| json!({}));
+    let shaped = json!({ "Data": { "Status": status_data } });
+    let print_info = extract_print_info_from_status_frame(Some(&shaped));
+
+    let is_printing = print_info.get("isPrinting").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_paused = print_info.get("isPaused").and_then(|v| v.as_bool()).unwrap_or(false);
+    let state = if is_paused { "paused" } else if is_printing { "printing" } else { "online" };
+    let state_text = if is_paused { "Paused" } else if is_printing { "Printing" } else { "Online" };
+
+    (
+        200,
+        json!({
+            "ok": true,
+            "connected": true,
+            "mode": "sdcp",
+            "hostName": mainboard_id,
+            "printerName": "SDCP Printer",
+            "printerModel": "SDCP 1.0",
+            "ipAddress": printer_ip,
+            "mainboardId": mainboard_id,
+            "firmwareVersion": "",
+            "stateText": state_text,
+            "statusText": "Connected via MQTT",
+            "state": state,
+            "isPrinting": is_printing,
+            "isPaused": is_paused,
+            "progressPct": print_info.get("progressPct").cloned().unwrap_or(Value::Null),
+            "currentLayer": print_info.get("currentLayer").cloned().unwrap_or(Value::Null),
+            "totalLayers": print_info.get("totalLayers").cloned().unwrap_or(Value::Null),
+            "plateId": Value::Null,
+            "jobName": print_info.get("jobName").cloned().unwrap_or(Value::Null),
+            "etaSec": print_info.get("etaSec").cloned().unwrap_or(Value::Null),
+        }),
+    )
+}
+
 async fn sdcp_printer_status(payload: &Value) -> (u16, Value) {
+    if is_mqtt_connected() {
+        return sdcp_mqtt_printer_status().await;
+    }
+
     let raw_host = resolve_raw_host(payload);
     let parsed = match parse_host_and_port(&raw_host) {
         Some(parsed) => parsed,
@@ -2693,7 +2961,63 @@ async fn sdcp_toggle_feature(payload: &Value, cmd: u64, feature_label: &str, ena
     )
 }
 
+fn build_control_data(payload: &Value, cmd: u64) -> Value {
+    if cmd != 128 {
+        return json!({});
+    }
+    let filename = payload.get("filename").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let job_name = payload.get("jobName").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let resolved = if !filename.is_empty() {
+        filename
+    } else if !path.is_empty() {
+        path
+    } else if !job_name.is_empty() {
+        let base = job_name.rsplit_once('.').map(|(b, _)| b).unwrap_or(job_name.as_str());
+        format!("{base}.goo")
+    } else {
+        String::new()
+    };
+    json!({ "Filename": resolved, "StartLayer": 0 })
+}
+
 async fn sdcp_control_operation(payload: &Value, cmd: u64, op_label: &str) -> (u16, Value) {
+    if is_mqtt_connected() {
+        let data = build_control_data(payload, cmd);
+        let result = tokio::task::spawn_blocking(move || {
+            let mut state = mqtt_state().lock().ok()?;
+            let m = state.as_mut()?;
+            mqtt::mqtt_send_command_await_response(
+                &mut m.stream,
+                &m.mainboard_id,
+                cmd,
+                data,
+                Duration::from_secs(6),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let ack = result
+            .as_ref()
+            .and_then(|f| f.pointer("/Data/Data/Ack").and_then(|v| v.as_i64()))
+            .unwrap_or(-1);
+        return (
+            200,
+            json!({
+                "ok": ack == 0,
+                "ack": ack,
+                "message": if ack == 0 {
+                    format!("SDCP {op_label} accepted.")
+                } else {
+                    format!("SDCP {op_label} rejected (Ack {ack}).")
+                },
+                "rawResponse": result.unwrap_or(Value::Null),
+            }),
+        );
+    }
+
     let raw_host = resolve_raw_host(payload);
     let parsed = match parse_host_and_port(&raw_host) {
         Some(parsed) => parsed,
@@ -3111,6 +3435,7 @@ async fn handle_sdcp_network(operation: &str, payload: &Value) -> (u16, Value) {
         "printer/resume" => sdcp_control_operation(payload, 131, op).await,
         "printer/unpause" => sdcp_control_operation(payload, 131, op).await,
         "upload/chunk" => sdcp_upload_chunk(payload).await,
+        "upload/mqtt-file" => sdcp_upload_mqtt_file(payload).await,
         "plate/delete" => sdcp_plate_delete(payload).await,
         "task/history/list" => sdcp_task_history_list(payload).await,
         "task/details" => sdcp_task_details(payload).await,
