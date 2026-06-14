@@ -1979,7 +1979,8 @@ async fn sdcp_connect(payload: &Value) -> (u16, Value) {
         .unwrap_or("")
         .to_string();
 
-    if mqtt::is_mqtt_firmware(&firmware_version) {
+    let force_mqtt = payload.get("transport").and_then(|v| v.as_str()) == Some("mqtt");
+    if force_mqtt || mqtt::is_mqtt_firmware(&firmware_version) {
         return sdcp_connect_via_mqtt(&host, port, &firmware_version, discovered.as_ref()).await;
     }
 
@@ -2005,6 +2006,11 @@ async fn sdcp_connect(payload: &Value) -> (u16, Value) {
                 "firmwareVersion": enriched.get("firmwareVersion").cloned().unwrap_or(Value::String("".to_string())),
             }),
         )
+        }
+        None if firmware_version.is_empty() => {
+            // WebSocket probe failed and UDP discovery gave us no firmware info.
+            // This could be a V1.0.0 MQTT printer — try MQTT before giving up.
+            sdcp_connect_via_mqtt(&host, port, &firmware_version, discovered.as_ref()).await
         }
         None => (
             200,
@@ -2041,12 +2047,20 @@ async fn sdcp_connect_via_mqtt(
         .to_string();
 
     let result = tokio::task::spawn_blocking(move || {
+        // Try the standard MQTT port first; fall back to an OS-assigned port if
+        // another broker (Mosquitto, Home Assistant, etc.) is already bound to 1883.
         let listener = std::net::TcpListener::bind(
             format!("0.0.0.0:{}", mqtt::MQTT_BROKER_PORT)
         )
-        .map_err(|e| format!("failed to bind MQTT broker port: {e}"))?;
+        .or_else(|_| std::net::TcpListener::bind("0.0.0.0:0"))
+        .map_err(|e| format!("failed to bind MQTT broker: {e}"))?;
 
-        mqtt::send_mqtt_trigger(&ip, mqtt::MQTT_BROKER_PORT)
+        let broker_port = listener
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(mqtt::MQTT_BROKER_PORT);
+
+        mqtt::send_mqtt_trigger(&ip, broker_port)
             .map_err(|e| format!("failed to send MQTT UDP trigger: {e}"))?;
 
         let (mut stream, client_id) =

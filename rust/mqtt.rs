@@ -254,7 +254,10 @@ pub(super) fn accept_mqtt_client(
     let mut stream = loop {
         match listener.accept() {
             Ok((s, _)) => break s,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == Some(10035) =>
+            {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -267,6 +270,9 @@ pub(super) fn accept_mqtt_client(
         }
     };
 
+    // On Windows, accepted sockets inherit non-blocking from the listener.
+    // Reset to blocking before any reads so SO_RCVTIMEO is respected.
+    stream.set_nonblocking(false)?;
     listener.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
