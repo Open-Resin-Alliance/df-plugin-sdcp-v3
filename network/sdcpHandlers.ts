@@ -130,6 +130,13 @@ function getLocalBroadcastAddresses(): string[] {
   return Array.from(addresses);
 }
 
+/** Handler payloads arrive as opaque JSON. Reading a field off the record and
+ *  then narrowing it is what the handlers already did behind an `as any`; a
+ *  non-object payload simply has no fields. */
+function payloadFields(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
+}
+
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -1011,22 +1018,23 @@ async function resolveMainboardIdViaWebSocket(host: string, port: number, timeou
 }
 
 async function handleSdcpUploadChunk(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const uuid = typeof (payload as any)?.uuid === 'string' ? (payload as any).uuid.trim() : '';
-  const fileName = typeof (payload as any)?.fileName === 'string' ? (payload as any).fileName.trim() : '';
-  const totalSize = clampNumber((payload as any)?.totalSize, 0, 0, Number.MAX_SAFE_INTEGER);
-  const offset = clampNumber((payload as any)?.offset, 0, 0, Number.MAX_SAFE_INTEGER);
-  const chunkBase64 = typeof (payload as any)?.chunkBase64 === 'string' ? (payload as any).chunkBase64.trim() : '';
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const uuid = typeof p.uuid === 'string' ? p.uuid.trim() : '';
+  const fileName = typeof p.fileName === 'string' ? p.fileName.trim() : '';
+  const totalSize = clampNumber(p.totalSize, 0, 0, Number.MAX_SAFE_INTEGER);
+  const offset = clampNumber(p.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+  const chunkBase64 = typeof p.chunkBase64 === 'string' ? p.chunkBase64.trim() : '';
   if (!uuid || !fileName || !chunkBase64) {
     return { status: 400, body: { ok: false, error: 'Missing required SDCP upload chunk fields' } };
   }
@@ -1096,7 +1104,6 @@ async function sendSdcpCommandAndAwaitResponse(args: {
   timeoutMs: number;
 }): Promise<SdcpWsFrame | null> {
   const { host, port, mainboardId, cmd, data = {}, timeoutMs } = args;
-  const startedAt = Date.now();
   const requestId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `sdcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1588,17 +1595,18 @@ async function probeSdcpHost(hostOrIp: string, port: number, timeoutMs: number):
 }
 
 async function handleSdcpConnect(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
   const probed = await probeSdcpHost(parsedHost.host, port, 3500);
 
   if (!probed) {
@@ -1638,24 +1646,25 @@ async function handleSdcpConnect(payload: unknown): Promise<HandlerResult> {
 }
 
 async function handleSdcpDiscover(payload: unknown): Promise<HandlerResult> {
-  const mode = (payload as any)?.mode;
+  const p = payloadFields(payload);
+  const mode = p.mode;
   if (mode && mode !== 'sdcp') {
     return { status: 400, body: { error: 'Unsupported network mode' } };
   }
 
-  const scopeRaw = (payload as any)?.scanScope;
+  const scopeRaw = p.scanScope;
   const scanScope: DiscoveryScope = scopeRaw === 'local-hostnames' || scopeRaw === 'subnet' || scopeRaw === 'all'
     ? scopeRaw
     : 'all';
 
-  const progressive = (payload as any)?.progressive === true;
-  const requestedBatchStart = clampNumber((payload as any)?.batchStart, 0, 0, Number.MAX_SAFE_INTEGER);
-  const probeTimeoutMs = clampNumber((payload as any)?.probeTimeoutMs, 1200, 250, 8000);
+  const progressive = p.progressive === true;
+  const requestedBatchStart = clampNumber(p.batchStart, 0, 0, Number.MAX_SAFE_INTEGER);
+  const probeTimeoutMs = clampNumber(p.probeTimeoutMs, 1200, 250, 8000);
 
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const forcedHostParsed = rawHost.trim().length > 0 ? parseHostAndPort(rawHost) : null;
   const forcedHost = forcedHostParsed?.host ?? null;
@@ -1664,8 +1673,8 @@ async function handleSdcpDiscover(payload: unknown): Promise<HandlerResult> {
   const foundByAddress = new Map<string, SdcpDiscoveredDevice>();
   udpDevices.forEach((device) => foundByAddress.set(device.ipAddress, device));
 
-  const seedIps = Array.isArray((payload as any)?.seedIps)
-    ? (payload as any).seedIps.filter((value: unknown): value is string => typeof value === 'string' && value.trim().length > 0)
+  const seedIps = Array.isArray(p.seedIps)
+    ? p.seedIps.filter((value: unknown): value is string => typeof value === 'string' && value.trim().length > 0)
     : [];
   const fallbackSeeds = Array.from(new Set([...(forcedHost ? [forcedHost] : []), ...seedIps]));
 
@@ -1709,21 +1718,22 @@ async function handleSdcpDiscover(payload: unknown): Promise<HandlerResult> {
 }
 
 async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     console.info('[sdcp-v3][printer/status] invalid-host', {
       rawHost,
-      payloadMainboardId: typeof (payload as any)?.mainboardId === 'string' ? String((payload as any).mainboardId).trim() : '',
+      payloadMainboardId: typeof p.mainboardId === 'string' ? String(p.mainboardId).trim() : '',
     });
     return { status: 400, body: { ok: false, connected: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
   const probed = await probeSdcpHost(parsedHost.host, port, 6500);
   if (!probed) {
     console.info('[sdcp-v3][printer/status] probe-failed', {
@@ -1755,8 +1765,8 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
     };
   }
 
-  const payloadMainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const payloadMainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : '';
   if (payloadMainboardId) {
     storeCachedMainboardId(parsedHost.host, port, payloadMainboardId);
@@ -1780,8 +1790,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
 
   let taskDetailAck: number | null = null;
   let activeTaskDetail: Record<string, unknown> | null = null;
-  let taskIdsUsed: string[] = [];
-  let taskDetailsCount = 0;
 
   if (mainboardId) {
     const explicitTaskIds = printInfo.taskId ? [printInfo.taskId] : [];
@@ -1795,7 +1803,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
         data: {},
         timeoutMs: 3200,
       })).slice(0, 20);
-    taskIdsUsed = taskIds;
 
     if (taskIds.length > 0) {
       const detailResponse = await sendSdcpCommandAndAwaitResponse({
@@ -1808,7 +1815,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
       });
       taskDetailAck = extractSdcpAck(detailResponse);
       const taskDetails = parseSdcpTaskDetailsFromResponse(detailResponse);
-      taskDetailsCount = taskDetails.length;
       activeTaskDetail = resolveSdcpActiveTaskDetail({
         taskDetails,
         taskId: printInfo.taskId,
@@ -1831,28 +1837,6 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
     : null;
   const activeTaskName = activeTaskDetail
     ? extractSdcpStringFromRecord(activeTaskDetail, ['TaskName', 'taskName', 'Name', 'name'])
-    : null;
-  const activeTaskSliceInformation = activeTaskDetail
-    ? parseSdcpMaybeObject(selectSdcpFirstDefined(activeTaskDetail, ['SliceInformation', 'sliceInformation', 'SliceInfo', 'sliceInfo']))
-    : null;
-  const activeTaskKeys = activeTaskDetail ? Object.keys(activeTaskDetail) : [];
-  const activeTaskSliceInfoKeys = activeTaskSliceInformation ? Object.keys(activeTaskSliceInformation) : [];
-  const activeTaskAlreadyPrintLayer = activeTaskDetail
-    ? parseSdcpNonNegativeInteger(selectSdcpFirstDefined(activeTaskDetail, [
-      'AlreadyPrintLayer', 'alreadyPrintLayer', 'already_print_layer',
-    ]))
-    : null;
-  const activeTaskCurrentLayerTalVolume = activeTaskDetail
-    ? parseSdcpPositiveNumber(selectSdcpFirstDefined(activeTaskDetail, [
-      'CurrentLayerTalVolume', 'CurrentLayerTotalVolume',
-      'currentLayerTalVolume', 'currentLayerTotalVolume',
-      'PrintedVolume', 'printedVolume',
-    ]))
-    : null;
-  const activeTaskSliceVolume = activeTaskSliceInformation
-    ? parseSdcpPositiveNumber(selectSdcpFirstDefined(activeTaskSliceInformation, [
-      'volume', 'Volume', 'modelVolume', 'model_volume',
-    ]))
     : null;
   const hasCurrentTaskIdentity = Boolean(printInfo.taskId || printInfo.jobName);
   const hasActiveTaskHeuristic = isSdcpTaskDetailLikelyActive(activeTaskDetail);
@@ -1954,10 +1938,11 @@ async function handleSdcpPrinterStatus(payload: unknown): Promise<HandlerResult>
 }
 
 async function handleSdcpWebcamInfo(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
@@ -1995,19 +1980,20 @@ function normalizeSdcpStoragePath(value: unknown): string {
 }
 
 async function handleSdcpToggleFeature(payload: unknown, cmd: 386 | 387, featureLabel: string, enabled: boolean): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return { status: 200, body: { ok: false, error: `Unable to resolve SDCP mainboard ID for ${featureLabel} command.` } };
@@ -2021,7 +2007,7 @@ async function handleSdcpToggleFeature(payload: unknown, cmd: 386 | 387, feature
     data: { Enable: enabled ? 1 : 0 },
     timeoutMs: 3200,
   });
-  const ack = Number((response?.Data?.Data as any)?.Ack);
+  const ack = Number((response?.Data?.Data as Record<string, unknown> | undefined)?.Ack);
   const ackDescription = cmd === 386
     ? (ack === 0
       ? 'success'
@@ -2059,19 +2045,20 @@ async function handleSdcpToggleFeature(payload: unknown, cmd: 386 | 387, feature
 }
 
 async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, metadataReady: false, error: 'Invalid host or IP address', plates: [] } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return {
@@ -2091,7 +2078,7 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
     port,
     mainboardId,
     cmd: 258,
-    data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? (payload as any)?.source) },
+    data: { Url: normalizeSdcpStoragePath(p.storagePath ?? p.url ?? p.source) },
     timeoutMs: 3200,
   });
   const listAck = extractSdcpAck(response);
@@ -2151,15 +2138,15 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
     return mergeSdcpTaskDetailIntoPlate(plate, matchedDetail);
   });
 
-  const requestedPlateId = Number((payload as any)?.plateId);
-  const requestedJobName = typeof (payload as any)?.jobName === 'string' ? (payload as any).jobName.trim().toLowerCase() : '';
+  const requestedPlateId = Number(p.plateId);
+  const requestedJobName = typeof p.jobName === 'string' ? p.jobName.trim().toLowerCase() : '';
   const matchedPlate = list.find((entry) => {
     if (Number.isFinite(requestedPlateId) && requestedPlateId > 0) {
-      return Number((entry as any).PlateID) === Math.round(requestedPlateId);
+      return Number((entry as Record<string, unknown>).PlateID) === Math.round(requestedPlateId);
     }
     if (requestedJobName) {
-      const path = String((entry as any).Path ?? '').toLowerCase();
-      const name = String((entry as any).Name ?? '').toLowerCase();
+      const path = String((entry as Record<string, unknown>).Path ?? '').toLowerCase();
+      const name = String((entry as Record<string, unknown>).Name ?? '').toLowerCase();
       return path.includes(requestedJobName) || name.includes(requestedJobName);
     }
     return false;
@@ -2180,28 +2167,29 @@ async function handleSdcpPlatesList(payload: unknown): Promise<HandlerResult> {
 }
 
 async function handleSdcpPlateDelete(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for delete command.' } };
   }
 
-  const plateIdRaw = parseSdcpPositiveInteger((payload as any)?.plateId);
-  const directFilename = typeof (payload as any)?.filename === 'string' ? (payload as any).filename.trim() : '';
-  const directPath = typeof (payload as any)?.path === 'string' ? (payload as any).path.trim() : '';
-  const directName = typeof (payload as any)?.jobName === 'string' ? (payload as any).jobName.trim() : '';
+  const plateIdRaw = parseSdcpPositiveInteger(p.plateId);
+  const directFilename = typeof p.filename === 'string' ? p.filename.trim() : '';
+  const directPath = typeof p.path === 'string' ? p.path.trim() : '';
+  const directName = typeof p.jobName === 'string' ? p.jobName.trim() : '';
 
   let resolvedPath = directPath || directFilename;
 
@@ -2211,7 +2199,7 @@ async function handleSdcpPlateDelete(payload: unknown): Promise<HandlerResult> {
       port,
       mainboardId,
       cmd: 258,
-      data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? '/local/') },
+      data: { Url: normalizeSdcpStoragePath(p.storagePath ?? p.url ?? '/local/') },
       timeoutMs: 3200,
     });
 
@@ -2275,19 +2263,20 @@ async function handleSdcpPlateDelete(payload: unknown): Promise<HandlerResult> {
 }
 
 async function handleSdcpTaskHistoryList(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for task history command.' } };
@@ -2317,26 +2306,27 @@ async function handleSdcpTaskHistoryList(payload: unknown): Promise<HandlerResul
 }
 
 async function handleSdcpTaskDetails(payload: unknown): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for task details command.' } };
   }
 
-  const providedTaskIds = Array.isArray((payload as any)?.taskIds)
-    ? (payload as any).taskIds
+  const providedTaskIds = Array.isArray(p.taskIds)
+    ? p.taskIds
       .filter((value: unknown): value is string => typeof value === 'string' && value.trim().length > 0)
       .map((value: string) => value.trim())
     : [];
@@ -2394,27 +2384,28 @@ async function resolveSdcpStartFilename(
   port: number,
   mainboardId: string,
 ): Promise<string> {
-  const directFilename = typeof (payload as any)?.filename === 'string'
-    ? (payload as any).filename.trim()
+  const p = payloadFields(payload);
+  const directFilename = typeof p.filename === 'string'
+    ? p.filename.trim()
     : '';
   if (directFilename) return directFilename;
 
-  const directPath = typeof (payload as any)?.path === 'string'
-    ? (payload as any).path.trim()
+  const directPath = typeof p.path === 'string'
+    ? p.path.trim()
     : '';
   if (directPath) return directPath;
 
-  const jobName = typeof (payload as any)?.jobName === 'string'
-    ? (payload as any).jobName.trim()
+  const jobName = typeof p.jobName === 'string'
+    ? p.jobName.trim()
     : '';
   if (jobName) {
     const withExt = jobName.replace(/\.[^.]+$/i, '');
     return `${withExt}.ctb`;
   }
 
-  const plateId = parseSdcpPositiveInteger((payload as any)?.plateId);
-  const plateName = typeof (payload as any)?.plateName === 'string'
-    ? (payload as any).plateName.trim()
+  const plateId = parseSdcpPositiveInteger(p.plateId);
+  const plateName = typeof p.plateName === 'string'
+    ? p.plateName.trim()
     : '';
   const normalizedPlateName = normalizeSdcpComparablePath(plateName);
 
@@ -2425,7 +2416,7 @@ async function resolveSdcpStartFilename(
     port,
     mainboardId,
     cmd: 258,
-    data: { Url: normalizeSdcpStoragePath((payload as any)?.storagePath ?? (payload as any)?.url ?? '/local/') },
+    data: { Url: normalizeSdcpStoragePath(p.storagePath ?? p.url ?? '/local/') },
     timeoutMs: 3200,
   });
 
@@ -2451,19 +2442,20 @@ async function resolveSdcpStartFilename(
 }
 
 async function handleSdcpControlOperation(payload: unknown, cmd: number, opLabel: string): Promise<HandlerResult> {
-  const rawHost = typeof (payload as any)?.host === 'string'
-    ? (payload as any).host
-    : typeof (payload as any)?.ipAddress === 'string'
-      ? (payload as any).ipAddress
+  const p = payloadFields(payload);
+  const rawHost = typeof p.host === 'string'
+    ? p.host
+    : typeof p.ipAddress === 'string'
+      ? p.ipAddress
       : '';
   const parsedHost = parseHostAndPort(rawHost);
   if (!parsedHost) {
     return { status: 400, body: { ok: false, error: 'Invalid host or IP address' } };
   }
 
-  const port = clampNumber((payload as any)?.port, parsedHost.port, 1, 65535);
-  const mainboardId = typeof (payload as any)?.mainboardId === 'string' && looksLikeMainboardId((payload as any).mainboardId)
-    ? String((payload as any).mainboardId).trim()
+  const port = clampNumber(p.port, parsedHost.port, 1, 65535);
+  const mainboardId = typeof p.mainboardId === 'string' && looksLikeMainboardId(p.mainboardId)
+    ? String(p.mainboardId).trim()
     : await resolveMainboardIdForHost(parsedHost.host, port);
   if (!mainboardId) {
     return { status: 200, body: { ok: false, error: 'Unable to resolve SDCP mainboard ID for control command.' } };
@@ -2493,7 +2485,7 @@ async function handleSdcpControlOperation(payload: unknown, cmd: number, opLabel
     data: controlData,
     timeoutMs: 3200,
   });
-  const ack = Number((response?.Data?.Data as any)?.Ack);
+  const ack = Number((response?.Data?.Data as Record<string, unknown> | undefined)?.Ack);
 
   return {
     status: 200,
